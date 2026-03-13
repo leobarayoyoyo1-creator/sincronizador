@@ -4,8 +4,8 @@
   "server_url": "http://10.150.60.108:52501",
   "destination": "C:/Users/Leonardo/Documents/teste_envio",
   "host": "https://sync.lbwma.com",
-  "push_local": "C:/Users/Leonardo/Documents/codigos/sincronizador/tesfdgsdfgs",
-  "push_remote": "/sistemas/sincronizador/teste",
+  "push_local": "C:/Users/Leonardo/Documents/codigos/sincronizador/teste",
+  "push_remote": "/sistemas/sincronizador",
   "pull_local": "C:/Users/Leonardo/Documents/codigos/cnn/ml/datasets",
   "pull_remote": "/sistemas/photos/ml/datasets"
 }

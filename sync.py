@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
-"""Sincronizador — daemon always-on (systemd) + GUI Windows para push/pull.
+"""Sincronizador — daemon always-on (systemd) + GUI desktop para push/pull.
 
-Autenticação : handshake com senha → token de sessão em memória
+Autenticação : PBKDF2-SHA256 (600 000 iterações) → token de sessão
 Performance  :
-  - Modo archive  (> ARCHIVE_THRESHOLD arquivos): tar.gz em UMA requisição HTTP
-  - Modo paralelo (≤ ARCHIVE_THRESHOLD arquivos): ThreadPoolExecutor
-  - Session pooling: reutilização de conexões TCP/TLS via requests.Session
+  - Compressão zstd multi-thread (3-5x mais rápido que gzip)
+  - Modo archive (> ARCHIVE_THRESHOLD): tar+zstd em UMA requisição HTTP
+  - Modo paralelo (≤ ARCHIVE_THRESHOLD): ThreadPoolExecutor com 16 workers
+  - Session pooling com reutilização de conexões TCP/TLS
+  - Buffers de 512 KB para I/O de rede e disco
+  - Servidor waitress (quando disponível) para concorrência real
+Segurança    :
+  - Acesso restrito a BASE_DIR (/sistemas)
+  - Comparação constant-time de tokens (hmac.compare_digest)
 """
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -20,11 +27,21 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 from pathlib import Path, PurePosixPath
 
-CONFIG_FILE        = Path(__file__).parent / "config.json"
-PARALLEL_WORKERS   = 8    # conexões simultâneas no modo paralelo
-ARCHIVE_THRESHOLD  = 3    # acima disto usa tar.gz em vez de N requisições individuais
-ARCHIVE_BATCH_SIZE = 500  # arquivos por lote — evita timeout do cloudflare (~100 s)
+# ── constantes ─────────────────────────────────────────────────────────────────
 
+CONFIG_FILE = Path(__file__).parent / "config.json"
+PARALLEL_WORKERS = 16
+ARCHIVE_THRESHOLD = 3
+ARCHIVE_BATCH_SIZE = 800
+CHUNK_SIZE = 524288          # 512 KB
+BASE_DIR = Path("/sistemas")
+MTIME_TOLERANCE = 2          # segundos
+ZSTD_LEVEL = 1               # velocidade máxima, boa compressão
+ZSTD_THREADS = min(os.cpu_count() or 1, 8)
+PBKDF2_ITERATIONS = 600_000
+
+
+# ── utilidades ─────────────────────────────────────────────────────────────────
 
 def _fmt_bytes(n: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
@@ -34,7 +51,21 @@ def _fmt_bytes(n: int) -> str:
     return f"{n:.1f} TB"
 
 
-# ── config ────────────────────────────────────────────────────────────────────
+def _safe_path(user_path: str) -> Path | None:
+    """Valida que o caminho resolve dentro de BASE_DIR."""
+    if not user_path:
+        return None
+    try:
+        resolved = Path(user_path).resolve()
+        base = BASE_DIR.resolve()
+        if resolved == base or str(resolved).startswith(str(base) + os.sep):
+            return resolved
+    except (ValueError, OSError):
+        pass
+    return None
+
+
+# ── config ─────────────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
     if CONFIG_FILE.exists():
@@ -50,64 +81,91 @@ def save_config(data: dict):
         json.dump(current, f, indent=2)
 
 
-# ── auth helpers ──────────────────────────────────────────────────────────────
+# ── auth ───────────────────────────────────────────────────────────────────────
 
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+def _hash_password(password: str, salt: bytes | None = None) -> str:
+    if salt is None:
+        salt = secrets.token_bytes(32)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ITERATIONS)
+    return f"{salt.hex()}:{dk.hex()}"
 
 
-# ── daemon Flask ──────────────────────────────────────────────────────────────
+def _verify_password(password: str, stored: str) -> bool:
+    if ":" in stored:
+        salt_hex, hash_hex = stored.split(":", 1)
+        dk = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), bytes.fromhex(salt_hex), PBKDF2_ITERATIONS
+        )
+        return hmac.compare_digest(dk.hex(), hash_hex)
+    # SHA-256 legado
+    return hmac.compare_digest(
+        hashlib.sha256(password.encode()).hexdigest(), stored
+    )
+
+
+# ── daemon Flask ───────────────────────────────────────────────────────────────
 
 def make_daemon_app(password_hash: str):
+    import zstandard as zstd
     from flask import (
-        Flask, jsonify, send_file, abort,
-        request as freq, Response, stream_with_context,
+        Flask, Response, abort, jsonify, send_file,
+        request as freq, stream_with_context,
     )
 
     app = Flask(__name__)
-    app.active_token = None  # única sessão ativa
+    _token = {"value": None}
+    _lock = threading.Lock()
 
-    # ── auth ──────────────────────────────────────────────────────────────────
+    def _get_token():
+        with _lock:
+            return _token["value"]
+
+    def _set_token(v):
+        with _lock:
+            _token["value"] = v
 
     def require_auth(f):
         @wraps(f)
-        def decorated(*args, **kwargs):
-            token = freq.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-            if not token or token != app.active_token:
+        def wrapper(*a, **kw):
+            tok = freq.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+            active = _get_token()
+            if not tok or not active or not hmac.compare_digest(tok, active):
                 return jsonify({"error": "Não autorizado"}), 401
-            return f(*args, **kwargs)
-        return decorated
+            return f(*a, **kw)
+        return wrapper
 
     @app.route("/")
     def index():
-        return "<h1>Sincronizador Daemon</h1><p>OK</p>"
+        return "<h1>Sincronizador</h1><p>OK</p>"
 
     @app.route("/auth", methods=["POST"])
     def auth():
         data = freq.get_json(silent=True) or {}
-        if hash_password(data.get("password", "")) != password_hash:
+        pw = data.get("password", "")
+        if not _verify_password(pw, password_hash):
             return jsonify({"error": "Senha incorreta"}), 401
+        if ":" not in password_hash:
+            save_config({"password_hash": _hash_password(pw)})
         token = secrets.token_hex(32)
-        app.active_token = token   # invalida sessão anterior
+        _set_token(token)
         return jsonify({"token": token})
 
     @app.route("/logout", methods=["POST"])
     @require_auth
     def logout():
-        app.active_token = None
+        _set_token(None)
         return jsonify({"ok": True})
 
-    # ── manifesto ─────────────────────────────────────────────────────────────
+    # ── manifesto ──────────────────────────────────────────────────────────────
 
     @app.route("/manifest")
     @require_auth
     def manifest():
-        path_str = freq.args.get("path", "")
-        if not path_str:
-            abort(400, "path required")
-        src = Path(path_str).resolve()
+        src = _safe_path(freq.args.get("path", ""))
+        if src is None:
+            abort(403, "Caminho fora de /sistemas")
         if not src.exists() or not src.is_dir():
-            return jsonify([])   # destino inexistente → lista vazia (push cria)
+            return jsonify([])
         files = []
         for fp in src.rglob("*"):
             if fp.is_file():
@@ -119,12 +177,14 @@ def make_daemon_app(password_hash: str):
                 })
         return jsonify(files)
 
-    # ── transferência de arquivo único (fallback / poucos arquivos) ───────────
+    # ── arquivo único ──────────────────────────────────────────────────────────
 
     @app.route("/file", methods=["GET"])
     @require_auth
     def get_file():
-        p = Path(freq.args.get("path", "")).resolve()
+        p = _safe_path(freq.args.get("path", ""))
+        if p is None:
+            abort(403, "Caminho fora de /sistemas")
         if not p.is_file():
             abort(404)
         return send_file(p)
@@ -132,77 +192,80 @@ def make_daemon_app(password_hash: str):
     @app.route("/file", methods=["POST"])
     @require_auth
     def post_file():
-        path_str = freq.args.get("path", "")
-        if not path_str:
-            abort(400, "path required")
-        p = Path(path_str).resolve()
+        p = _safe_path(freq.args.get("path", ""))
+        if p is None:
+            abort(403, "Caminho fora de /sistemas")
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "wb") as out:
-            while chunk := freq.stream.read(65536):
+            while chunk := freq.stream.read(CHUNK_SIZE):
                 out.write(chunk)
         return jsonify({"ok": True})
 
-    # ── modo archive: tar.gz em uma única requisição ──────────────────────────
+    # ── archive tar+zstd ──────────────────────────────────────────────────────
 
     @app.route("/archive", methods=["POST"])
     @require_auth
     def get_archive():
-        """Recebe lista de arquivos, devolve tar.gz streamado."""
-        data  = freq.get_json(silent=True) or {}
-        base  = Path(data.get("base", "")).resolve()
+        data = freq.get_json(silent=True) or {}
+        base = _safe_path(data.get("base", ""))
         files = data.get("files", [])
-        if not files or not base.is_dir():
-            abort(400, "base (dir) e files obrigatórios")
+        if not files or base is None or not base.is_dir():
+            abort(400, "base (dir dentro de /sistemas) e files obrigatórios")
 
-        base_str = str(base)
+        base_pfx = str(base) + os.sep
         r_fd, w_fd = os.pipe()
 
         def _pack():
-            with os.fdopen(w_fd, "wb") as wf:
-                with tarfile.open(fileobj=wf, mode="w|gz") as tar:
-                    for rel in files:
-                        fp = (base / rel).resolve()
-                        if str(fp).startswith(base_str) and fp.is_file():
-                            tar.add(fp, arcname=rel)
+            cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL, threads=ZSTD_THREADS)
+            with os.fdopen(w_fd, "wb") as raw:
+                with cctx.stream_writer(raw, closefd=False) as zw:
+                    with tarfile.open(fileobj=zw, mode="w|") as tar:
+                        for rel in files:
+                            if rel.startswith("/") or ".." in rel.split("/"):
+                                continue
+                            fp = (base / rel).resolve()
+                            if str(fp).startswith(base_pfx) and fp.is_file():
+                                tar.add(fp, arcname=rel)
 
         t = threading.Thread(target=_pack, daemon=True)
         t.start()
 
         def _gen():
             with os.fdopen(r_fd, "rb") as rf:
-                while chunk := rf.read(65536):
+                while chunk := rf.read(CHUNK_SIZE):
                     yield chunk
             t.join()
 
-        return Response(stream_with_context(_gen()), mimetype="application/x-tar")
+        return Response(stream_with_context(_gen()), mimetype="application/zstd")
 
     @app.route("/archive", methods=["PUT"])
     @require_auth
     def put_archive():
-        """Recebe tar.gz e extrai na pasta de destino."""
-        dest_str = freq.args.get("path", "")
-        if not dest_str:
-            abort(400, "path required")
-        dest = Path(dest_str).resolve()
+        dest = _safe_path(freq.args.get("path", ""))
+        if dest is None:
+            abort(403, "Caminho fora de /sistemas")
         dest.mkdir(parents=True, exist_ok=True)
-        dest_safe = str(dest)
+        dest_pfx = str(dest) + os.sep
 
-        with tarfile.open(fileobj=freq.stream, mode="r|gz") as tar:
+        dctx = zstd.ZstdDecompressor()
+        reader = dctx.stream_reader(freq.stream, closefd=False)
+
+        with tarfile.open(fileobj=reader, mode="r|") as tar:
             for member in tar:
                 if not (member.isreg() or member.isdir()):
                     continue
                 if member.name.startswith("/") or ".." in member.name:
                     continue
                 out = (dest / member.name).resolve()
-                if not str(out).startswith(dest_safe):
+                if not str(out).startswith(dest_pfx):
                     continue
                 if member.isdir():
                     out.mkdir(parents=True, exist_ok=True)
                 else:
                     out.parent.mkdir(parents=True, exist_ok=True)
-                    with tar.extractfile(member) as src, open(out, "wb") as dst:
-                        while chunk := src.read(65536):
-                            dst.write(chunk)
+                    with tar.extractfile(member) as sf, open(out, "wb") as df:
+                        while chunk := sf.read(CHUNK_SIZE):
+                            df.write(chunk)
                     try:
                         os.utime(out, (member.mtime, member.mtime))
                     except OSError:
@@ -215,34 +278,40 @@ def make_daemon_app(password_hash: str):
 
 def run_daemon(port: int):
     cfg = load_config()
-    password_hash = cfg.get("password_hash")
-    if not password_hash:
-        print("Nenhuma senha configurada. Execute primeiro:", file=sys.stderr)
+    ph = cfg.get("password_hash")
+    if not ph:
+        print("Nenhuma senha configurada. Execute:", file=sys.stderr)
         print("  python sincronizador.py setpassword", file=sys.stderr)
         sys.exit(1)
 
-    app = make_daemon_app(password_hash)
-    import logging
-    logging.getLogger("werkzeug").setLevel(logging.WARNING)
-    print(f"Daemon escutando em http://127.0.0.1:{port}")
-    print("Ctrl+C para parar.")
-    app.run(host="127.0.0.1", port=port, threaded=True)
+    app = make_daemon_app(ph)
+
+    try:
+        from waitress import serve
+        print(f"Daemon em http://127.0.0.1:{port}  (waitress, {ZSTD_THREADS} threads zstd)")
+        serve(app, host="127.0.0.1", port=port, threads=8)
+    except ImportError:
+        import logging
+        logging.getLogger("werkzeug").setLevel(logging.WARNING)
+        print(f"Daemon em http://127.0.0.1:{port}  (werkzeug)")
+        print("  dica: pip install waitress  para melhor performance")
+        app.run(host="127.0.0.1", port=port, threaded=True)
 
 
 def cmd_setpassword():
     import getpass
     pw = getpass.getpass("Nova senha: ")
     if not pw:
-        print("Senha não pode ser vazia.", file=sys.stderr)
+        print("Senha vazia.", file=sys.stderr)
         sys.exit(1)
-    if pw != getpass.getpass("Confirmar senha: "):
-        print("Senhas não conferem.", file=sys.stderr)
+    if pw != getpass.getpass("Confirmar: "):
+        print("Não conferem.", file=sys.stderr)
         sys.exit(1)
-    save_config({"password_hash": hash_password(pw)})
-    print("Senha salva.")
+    save_config({"password_hash": _hash_password(pw)})
+    print("Senha salva (PBKDF2-SHA256).")
 
 
-# ── cliente de API ────────────────────────────────────────────────────────────
+# ── cliente ────────────────────────────────────────────────────────────────────
 
 class SyncClient:
     def __init__(self, host: str, token: str):
@@ -254,21 +323,18 @@ class SyncClient:
         self.session = requests.Session()
         self.session.headers["Authorization"] = f"Bearer {token}"
 
-        # pool de conexões maior + retry automático em falhas de rede
         adapter = HTTPAdapter(
             max_retries=Retry(total=3, backoff_factor=0.5,
                               status_forcelist=[502, 503, 504]),
             pool_connections=PARALLEL_WORKERS,
             pool_maxsize=PARALLEL_WORKERS * 2,
         )
-        self.session.mount("http://",  adapter)
+        self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
-
-    # ── operações individuais (poucos arquivos) ───────────────────────────────
 
     def get_manifest(self, remote_path: str) -> list:
         r = self.session.get(
-            f"{self.base}/manifest", params={"path": remote_path}, timeout=15
+            f"{self.base}/manifest", params={"path": remote_path}, timeout=30,
         )
         r.raise_for_status()
         return r.json()
@@ -281,7 +347,7 @@ class SyncClient:
         r.raise_for_status()
         local_path.parent.mkdir(parents=True, exist_ok=True)
         with open(local_path, "wb") as f:
-            for chunk in r.iter_content(65536):
+            for chunk in r.iter_content(CHUNK_SIZE):
                 f.write(chunk)
 
     def upload(self, local_path: Path, remote_file: str):
@@ -292,15 +358,11 @@ class SyncClient:
             )
         r.raise_for_status()
 
-    # ── modo archive: tar.gz em UMA requisição ────────────────────────────────
+    def download_archive(self, base_path, files, local_dest, log_fn, progress_fn=None):
+        import zstandard as zstd
 
-    def download_archive(
-        self, base_path: str, files: list,
-        local_dest: Path, log_fn, progress_fn=None,
-    ):
-        """Baixa múltiplos arquivos como tar.gz — 1 requisição HTTP."""
         total = len(files)
-        total_size = 0   # acumulado de bytes descomprimidos para exibição
+        total_bytes = 0
         log_fn(f"Recebendo {total} arquivo(s)...")
         if progress_fn:
             progress_fn(0)
@@ -312,28 +374,31 @@ class SyncClient:
         )
         r.raise_for_status()
 
-        dest_safe = str(local_dest.resolve())
+        dest_pfx = str(local_dest.resolve()) + os.sep
+        dctx = zstd.ZstdDecompressor()
         r.raw.decode_content = True
-        extracted = 0
-        skipped   = 0
+        reader = dctx.stream_reader(r.raw, closefd=False)
 
-        with tarfile.open(fileobj=r.raw, mode="r|gz") as tar:
+        extracted = 0
+        skipped = 0
+
+        with tarfile.open(fileobj=reader, mode="r|") as tar:
             for member in tar:
                 if not (member.isreg() or member.isdir()):
                     continue
                 if member.name.startswith("/") or ".." in member.name:
                     continue
                 out = (local_dest / member.name).resolve()
-                if not str(out).startswith(dest_safe):
+                if not str(out).startswith(dest_pfx):
                     continue
                 if member.isdir():
                     out.mkdir(parents=True, exist_ok=True)
                     continue
 
-                # Pula se já existe com mesmo tamanho e mtime
                 if out.is_file():
                     st = out.stat()
-                    if st.st_size == member.size and abs(st.st_mtime - member.mtime) <= 2:
+                    if (st.st_size == member.size
+                            and abs(st.st_mtime - member.mtime) <= MTIME_TOLERANCE):
                         skipped += 1
                         extracted += 1
                         if progress_fn:
@@ -341,69 +406,60 @@ class SyncClient:
                         continue
 
                 out.parent.mkdir(parents=True, exist_ok=True)
-                with tar.extractfile(member) as src, open(out, "wb") as dst:
-                    while chunk := src.read(65536):
-                        dst.write(chunk)
+                with tar.extractfile(member) as sf, open(out, "wb") as df:
+                    while chunk := sf.read(CHUNK_SIZE):
+                        df.write(chunk)
                 try:
                     os.utime(out, (member.mtime, member.mtime))
                 except OSError:
                     pass
+
                 extracted += 1
-                total_size += member.size
-                log_fn(f"[{extracted}/{total}] {member.name}  ({_fmt_bytes(total_size)})")
+                total_bytes += member.size
+                log_fn(f"[{extracted}/{total}] {member.name}  ({_fmt_bytes(total_bytes)})")
                 if progress_fn:
                     progress_fn(extracted / total * 100)
 
         if skipped:
-            log_fn(f"  ({skipped} arquivo(s) já existiam, pulados)")
-
+            log_fn(f"  ({skipped} já existiam, pulados)")
         if progress_fn:
             progress_fn(100)
 
-    def upload_archive(
-        self, to_upload: list,
-        remote_dest: str, log_fn, progress_fn=None,
-    ):
-        """Envia múltiplos arquivos como tar.gz — 1 requisição HTTP."""
+    def upload_archive(self, to_upload, remote_dest, log_fn, progress_fn=None):
+        import zstandard as zstd
+
         total = len(to_upload)
         total_size = sum(fp.stat().st_size for _, fp in to_upload)
-        log_fn(f"Enviando {total} arquivo(s)  ({_fmt_bytes(total_size)} total)...")
+        log_fn(f"Enviando {total} arquivo(s) ({_fmt_bytes(total_size)})...")
         if progress_fn:
             progress_fn(0)
 
-        # pipe: empacotar e enviar em streaming sem carregar tudo na memória.
-        # O _pack roda em thread separada e reporta progresso por arquivo;
-        # como o pipe sincroniza escrita/leitura, o progresso de empacotamento
-        # reflete o progresso real de upload.
         r_fd, w_fd = os.pipe()
 
         def _pack():
-            with os.fdopen(w_fd, "wb") as wf:
-                with tarfile.open(fileobj=wf, mode="w|gz") as tar:
-                    for i, (rel, fp) in enumerate(to_upload, 1):
-                        tar.add(str(fp), arcname=rel)
-                        log_fn(f"[{i}/{total}] {rel}  ({_fmt_bytes(fp.stat().st_size)})")
-                        if progress_fn:
-                            progress_fn(i / total * 100)
+            cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL, threads=ZSTD_THREADS)
+            with os.fdopen(w_fd, "wb") as raw:
+                with cctx.stream_writer(raw, closefd=False) as zw:
+                    with tarfile.open(fileobj=zw, mode="w|") as tar:
+                        for i, (rel, fp) in enumerate(to_upload, 1):
+                            tar.add(str(fp), arcname=rel)
+                            log_fn(f"[{i}/{total}] {rel}  ({_fmt_bytes(fp.stat().st_size)})")
+                            if progress_fn:
+                                progress_fn(i / total * 100)
 
         pack_thread = threading.Thread(target=_pack, daemon=True)
         pack_thread.start()
 
         with os.fdopen(r_fd, "rb") as rf:
             r = self.session.put(
-                f"{self.base}/archive",
-                params={"path": remote_dest},
-                data=rf,
-                timeout=600,
+                f"{self.base}/archive", params={"path": remote_dest},
+                data=rf, timeout=600,
             )
 
         pack_thread.join()
         r.raise_for_status()
-
         if progress_fn:
             progress_fn(100)
-
-    # ─────────────────────────────────────────────────────────────────────────
 
     def logout(self):
         try:
@@ -413,10 +469,9 @@ class SyncClient:
 
 
 def do_auth(host: str, password: str) -> str:
-    """Autentica e retorna o token. Lança ValueError em caso de falha."""
     import requests
     r = requests.post(
-        f"{host.rstrip('/')}/auth", json={"password": password}, timeout=10
+        f"{host.rstrip('/')}/auth", json={"password": password}, timeout=10,
     )
     if r.status_code == 401:
         raise ValueError("Senha incorreta.")
@@ -424,10 +479,9 @@ def do_auth(host: str, password: str) -> str:
     return r.json()["token"]
 
 
-# ── lógica de sincronização ───────────────────────────────────────────────────
+# ── lógica de sincronização ────────────────────────────────────────────────────
 
 def _diff_manifest(manifest: list, local_dest: Path) -> list:
-    """Retorna itens do manifesto que diferem do estado local."""
     to_get = []
     for item in manifest:
         local = local_dest / item["path"]
@@ -435,66 +489,61 @@ def _diff_manifest(manifest: list, local_dest: Path) -> list:
             to_get.append(item)
         else:
             st = local.stat()
-            if st.st_size != item["size"] or abs(st.st_mtime - item["mtime"]) > 1:
+            if (st.st_size != item["size"]
+                    or abs(st.st_mtime - item["mtime"]) > MTIME_TOLERANCE):
                 to_get.append(item)
     return to_get
 
 
-def pull(client: SyncClient, remote_path: str, local_dest: Path, log_fn, progress_fn=None):
-    """Baixa arquivos do daemon (remote_path) → local_dest."""
+def pull(client, remote_path, local_dest, log_fn, progress_fn=None):
     log_fn("Buscando lista de arquivos...")
     try:
         manifest = client.get_manifest(remote_path)
     except Exception as e:
-        log_fn(f"Erro ao conectar: {e}")
+        log_fn(f"Erro: {e}")
         return False
 
     to_download = _diff_manifest(manifest, local_dest)
     total, to_dl = len(manifest), len(to_download)
-    log_fn(f"{total} arquivo(s) no servidor — {to_dl} para baixar.")
+    log_fn(f"{total} no servidor — {to_dl} para baixar.")
 
     if to_dl == 0:
-        log_fn("Tudo já sincronizado!")
+        log_fn("Tudo sincronizado!")
         if progress_fn:
             progress_fn(100)
         return True
 
     if to_dl > ARCHIVE_THRESHOLD:
-        # ── modo archive em lotes — evita timeout do cloudflare ──────────────
-        files    = [item["path"] for item in to_download]
-        batches  = [files[i:i + ARCHIVE_BATCH_SIZE]
-                    for i in range(0, to_dl, ARCHIVE_BATCH_SIZE)]
-        n_batches = len(batches)
+        files = [item["path"] for item in to_download]
+        batches = [files[i:i + ARCHIVE_BATCH_SIZE]
+                   for i in range(0, to_dl, ARCHIVE_BATCH_SIZE)]
         done_files = 0
+        for bn, batch in enumerate(batches, 1):
+            if len(batches) > 1:
+                log_fn(f"── Lote {bn}/{len(batches)} ({len(batch)} arquivo(s)) ──")
+            base_done, batch_len = done_files, len(batch)
 
-        for batch_num, batch in enumerate(batches, 1):
-            if n_batches > 1:
-                log_fn(f"── Lote {batch_num}/{n_batches} ({len(batch)} arquivo(s)) ──")
-
-            base_done = done_files
-            batch_len = len(batch)
-
-            def _batch_pfn(v, _b=base_done, _l=batch_len):
+            def _pfn(v, _b=base_done, _l=batch_len):
                 if progress_fn:
                     progress_fn((_b + _l * v / 100) / to_dl * 100)
 
             for attempt in range(2):
                 try:
-                    client.download_archive(remote_path, batch, local_dest, log_fn, _batch_pfn)
+                    client.download_archive(
+                        remote_path, batch, local_dest, log_fn, _pfn,
+                    )
                     break
                 except Exception as e:
                     if attempt == 0:
                         log_fn(f"  Falha, tentando novamente... ({e})")
                     else:
-                        log_fn(f"  Erro no lote {batch_num}: {e}")
+                        log_fn(f"  Erro no lote {bn}: {e}")
                         return False
-
             done_files += batch_len
-
     else:
-        # ── modo paralelo: até PARALLEL_WORKERS downloads simultâneos ────────
         done = [0]
         lock = threading.Lock()
+        errors = []
 
         def _one(item):
             remote_file = str(PurePosixPath(remote_path) / item["path"])
@@ -504,7 +553,7 @@ def pull(client: SyncClient, remote_path: str, local_dest: Path, log_fn, progres
                 return done[0], item["path"]
 
         with ThreadPoolExecutor(max_workers=min(PARALLEL_WORKERS, to_dl)) as ex:
-            futures = {ex.submit(_one, item): item for item in to_download}
+            futures = {ex.submit(_one, it): it for it in to_download}
             for fut in as_completed(futures):
                 try:
                     n, path = fut.result()
@@ -512,23 +561,29 @@ def pull(client: SyncClient, remote_path: str, local_dest: Path, log_fn, progres
                     if progress_fn:
                         progress_fn(n / to_dl * 100)
                 except Exception as e:
+                    errors.append(str(e))
                     log_fn(f"  Erro: {e}")
+
+        if errors:
+            log_fn(f"{len(errors)} erro(s) durante download.")
+            return False
 
     log_fn("Concluído!")
     return True
 
 
-def push(client: SyncClient, local_source: Path, remote_dest: str, log_fn, progress_fn=None):
-    """Envia arquivos de local_source → daemon (remote_dest)."""
+def push(client, local_source, remote_dest, log_fn, progress_fn=None):
     src = local_source.resolve()
     local_files = {
         fp.relative_to(src).as_posix(): fp
         for fp in src.rglob("*") if fp.is_file()
     }
 
-    log_fn("Verificando arquivos remotos...")
+    log_fn("Verificando remotos...")
     try:
-        remote_index = {item["path"]: item for item in client.get_manifest(remote_dest)}
+        remote_index = {
+            item["path"]: item for item in client.get_manifest(remote_dest)
+        }
     except Exception:
         remote_index = {}
 
@@ -539,53 +594,47 @@ def push(client: SyncClient, local_source: Path, remote_dest: str, log_fn, progr
         else:
             st = fp.stat()
             ri = remote_index[rel]
-            if st.st_size != ri["size"] or abs(st.st_mtime - ri["mtime"]) > 1:
+            if (st.st_size != ri["size"]
+                    or abs(st.st_mtime - ri["mtime"]) > MTIME_TOLERANCE):
                 to_upload.append((rel, fp))
 
     total, to_ul = len(local_files), len(to_upload)
     log_fn(f"{total} arquivo(s) — {to_ul} para enviar.")
 
     if to_ul == 0:
-        log_fn("Tudo já sincronizado!")
+        log_fn("Tudo sincronizado!")
         if progress_fn:
             progress_fn(100)
         return True
 
     if to_ul > ARCHIVE_THRESHOLD:
-        # ── modo archive em lotes — evita timeout do cloudflare ──────────────
-        batches   = [to_upload[i:i + ARCHIVE_BATCH_SIZE]
-                     for i in range(0, to_ul, ARCHIVE_BATCH_SIZE)]
-        n_batches = len(batches)
+        batches = [to_upload[i:i + ARCHIVE_BATCH_SIZE]
+                   for i in range(0, to_ul, ARCHIVE_BATCH_SIZE)]
         done_files = 0
+        for bn, batch in enumerate(batches, 1):
+            if len(batches) > 1:
+                log_fn(f"── Lote {bn}/{len(batches)} ({len(batch)} arquivo(s)) ──")
+            base_done, batch_len = done_files, len(batch)
 
-        for batch_num, batch in enumerate(batches, 1):
-            if n_batches > 1:
-                log_fn(f"── Lote {batch_num}/{n_batches} ({len(batch)} arquivo(s)) ──")
-
-            base_done = done_files
-            batch_len = len(batch)
-
-            def _batch_pfn(v, _b=base_done, _l=batch_len):
+            def _pfn(v, _b=base_done, _l=batch_len):
                 if progress_fn:
                     progress_fn((_b + _l * v / 100) / to_ul * 100)
 
             for attempt in range(2):
                 try:
-                    client.upload_archive(batch, remote_dest, log_fn, _batch_pfn)
+                    client.upload_archive(batch, remote_dest, log_fn, _pfn)
                     break
                 except Exception as e:
                     if attempt == 0:
                         log_fn(f"  Falha, tentando novamente... ({e})")
                     else:
-                        log_fn(f"  Erro no lote {batch_num}: {e}")
+                        log_fn(f"  Erro no lote {bn}: {e}")
                         return False
-
             done_files += batch_len
-
     else:
-        # ── modo paralelo ─────────────────────────────────────────────────────
         done = [0]
         lock = threading.Lock()
+        errors = []
 
         def _one(item):
             rel, fp = item
@@ -595,7 +644,7 @@ def push(client: SyncClient, local_source: Path, remote_dest: str, log_fn, progr
                 return done[0], rel
 
         with ThreadPoolExecutor(max_workers=min(PARALLEL_WORKERS, to_ul)) as ex:
-            futures = {ex.submit(_one, item): item for item in to_upload}
+            futures = {ex.submit(_one, it): it for it in to_upload}
             for fut in as_completed(futures):
                 try:
                     n, rel = fut.result()
@@ -603,231 +652,347 @@ def push(client: SyncClient, local_source: Path, remote_dest: str, log_fn, progr
                     if progress_fn:
                         progress_fn(n / to_ul * 100)
                 except Exception as e:
+                    errors.append(str(e))
                     log_fn(f"  Erro: {e}")
+
+        if errors:
+            log_fn(f"{len(errors)} erro(s) durante upload.")
+            return False
 
     log_fn("Concluído!")
     return True
 
 
-# ── GUI ───────────────────────────────────────────────────────────────────────
+# ── GUI ────────────────────────────────────────────────────────────────────────
 
 def run_gui():
-    import tkinter as tk
-    from tkinter import ttk, filedialog, messagebox
+    import customtkinter as ctk
+    from tkinter import filedialog, messagebox
+
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
 
     cfg = load_config()
     client_ref = {"client": None}
+    busy_lock = threading.Lock()
 
-    root = tk.Tk()
+    root = ctk.CTk()
     root.title("Sincronizador")
-    root.resizable(False, False)
+    root.geometry("680x800")
+    root.minsize(620, 700)
 
-    # ── painel de conexão ─────────────────────────────────────────────────────
-    conn_frame = ttk.LabelFrame(root, text="Conexão", padding=10)
-    conn_frame.pack(fill="x", padx=10, pady=(10, 0))
+    def ui(fn):
+        try:
+            root.after(0, fn)
+        except Exception:
+            pass
 
-    tk.Label(conn_frame, text="Host:").grid(row=0, column=0, sticky="w", padx=4, pady=3)
-    host_var = tk.StringVar(value=cfg.get("host", "https://"))
-    tk.Entry(conn_frame, textvariable=host_var, width=38).grid(
-        row=0, column=1, sticky="ew", padx=4
+    # ── header ─────────────────────────────────────────────────────────────────
+
+    header = ctk.CTkFrame(root, fg_color="transparent")
+    header.pack(fill="x", padx=24, pady=(20, 0))
+    ctk.CTkLabel(
+        header, text="Sincronizador",
+        font=ctk.CTkFont(size=24, weight="bold"),
+    ).pack(side="left")
+    ctk.CTkLabel(
+        header, text="zstd + tar streaming",
+        font=ctk.CTkFont(size=12), text_color="#666",
+    ).pack(side="left", padx=(12, 0), pady=(6, 0))
+
+    # ── conexão ────────────────────────────────────────────────────────────────
+
+    conn = ctk.CTkFrame(root, corner_radius=12)
+    conn.pack(fill="x", padx=24, pady=(16, 0))
+    conn.columnconfigure(1, weight=1)
+
+    ctk.CTkLabel(
+        conn, text="Conexão", font=ctk.CTkFont(size=15, weight="bold"),
+    ).grid(row=0, column=0, columnspan=3, sticky="w", padx=20, pady=(16, 8))
+
+    ctk.CTkLabel(conn, text="Host", width=60).grid(
+        row=1, column=0, sticky="w", padx=(20, 8), pady=6,
     )
+    host_entry = ctk.CTkEntry(conn, placeholder_text="https://...")
+    host_entry.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 20), pady=6)
+    if cfg.get("host"):
+        host_entry.insert(0, cfg["host"])
 
-    tk.Label(conn_frame, text="Senha:").grid(row=1, column=0, sticky="w", padx=4, pady=3)
-    pw_var = tk.StringVar()
-    tk.Entry(conn_frame, textvariable=pw_var, show="*", width=26).grid(
-        row=1, column=1, sticky="w", padx=4
+    ctk.CTkLabel(conn, text="Senha", width=60).grid(
+        row=2, column=0, sticky="w", padx=(20, 8), pady=6,
     )
+    pw_entry = ctk.CTkEntry(conn, show="*", placeholder_text="Senha do daemon")
+    pw_entry.grid(row=2, column=1, sticky="ew", padx=0, pady=6)
 
-    conn_status_var = tk.StringVar(value="Desconectado.")
-    tk.Label(conn_frame, textvariable=conn_status_var, fg="gray").grid(
-        row=2, column=0, columnspan=3, pady=(4, 0)
+    conn_btn = ctk.CTkButton(
+        conn, text="Conectar", width=120,
+        fg_color="#E67E22", hover_color="#D35400",
+        font=ctk.CTkFont(size=13, weight="bold"),
     )
+    conn_btn.grid(row=2, column=2, padx=(12, 20), pady=6)
 
-    conn_btn = tk.Button(
-        conn_frame, text="Conectar",
-        bg="#FF9800", fg="white", font=("Arial", 10, "bold"), padx=10,
+    status_dot = ctk.CTkLabel(
+        conn, text="●  Desconectado",
+        text_color="#666", font=ctk.CTkFont(size=12),
     )
-    conn_btn.grid(row=1, column=2, padx=8)
+    status_dot.grid(row=3, column=0, columnspan=3, sticky="w", padx=20, pady=(4, 16))
 
-    # ── abas de operação ──────────────────────────────────────────────────────
-    nb = ttk.Notebook(root)
-    nb.pack(fill="both", expand=True, padx=10, pady=10)
+    # ── tabs ───────────────────────────────────────────────────────────────────
 
-    pad = {"padx": 10, "pady": 5}
-    op_buttons = []
+    tabview = ctk.CTkTabview(root, corner_radius=12)
+    tabview.pack(fill="both", expand=True, padx=24, pady=(16, 24))
 
-    def make_op_tab(parent, mode):
+    tab_push = tabview.add("  Enviar  →  ")
+    tab_pull = tabview.add("  ←  Receber  ")
+
+    op_buttons: list[ctk.CTkButton] = []
+
+    def build_tab(parent, mode):
         is_push = mode == "push"
 
-        lbl_local  = "Pasta local (origem):"    if is_push else "Pasta local (destino):"
-        lbl_remote = "Pasta no Linux (destino):" if is_push else "Pasta no Linux (origem):"
+        lbl_local = "Pasta local (origem)" if is_push else "Pasta local (destino)"
+        lbl_remote = "Pasta remota (destino)" if is_push else "Pasta remota (origem)"
 
-        tk.Label(parent, text=lbl_local).grid(row=0, column=0, sticky="w", **pad)
-        local_var = tk.StringVar(value=cfg.get(f"{mode}_local", ""))
-        tk.Entry(parent, textvariable=local_var, width=32).grid(
-            row=0, column=1, sticky="ew", **pad
+        # local path
+        ctk.CTkLabel(
+            parent, text=lbl_local, font=ctk.CTkFont(size=12),
+        ).pack(anchor="w", padx=20, pady=(14, 3))
+
+        local_row = ctk.CTkFrame(parent, fg_color="transparent")
+        local_row.pack(fill="x", padx=20, pady=(0, 10))
+        local_entry = ctk.CTkEntry(
+            local_row, placeholder_text="Selecione uma pasta...",
         )
-        tk.Button(parent, text="...", command=lambda: local_var.set(
-            filedialog.askdirectory() or local_var.get()
-        )).grid(row=0, column=2, **pad)
+        local_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        if cfg.get(f"{mode}_local"):
+            local_entry.insert(0, cfg[f"{mode}_local"])
 
-        tk.Label(parent, text=lbl_remote).grid(row=1, column=0, sticky="w", **pad)
-        remote_var = tk.StringVar(value=cfg.get(f"{mode}_remote", ""))
-        tk.Entry(parent, textvariable=remote_var, width=36).grid(
-            row=1, column=1, columnspan=2, sticky="ew", **pad
+        def _browse():
+            d = filedialog.askdirectory()
+            if d:
+                local_entry.delete(0, "end")
+                local_entry.insert(0, d)
+
+        ctk.CTkButton(
+            local_row, text="Procurar", width=100, command=_browse,
+        ).pack(side="right")
+
+        # remote path
+        ctk.CTkLabel(
+            parent, text=lbl_remote, font=ctk.CTkFont(size=12),
+        ).pack(anchor="w", padx=20, pady=(2, 3))
+
+        remote_entry = ctk.CTkEntry(
+            parent, placeholder_text="/sistemas/...",
         )
+        remote_entry.pack(fill="x", padx=20, pady=(0, 14))
+        if cfg.get(f"{mode}_remote"):
+            remote_entry.insert(0, cfg[f"{mode}_remote"])
 
-        btn = tk.Button(
-            parent,
-            text="Enviar →" if is_push else "← Receber",
-            bg="#2196F3" if is_push else "#4CAF50",
-            fg="white", font=("Arial", 11, "bold"), padx=14, pady=4,
+        # action button
+        if is_push:
+            btn_fg, btn_hover = "#2980B9", "#2471A3"
+            btn_text = "Enviar  →"
+        else:
+            btn_fg, btn_hover = "#27AE60", "#229954"
+            btn_text = "←  Receber"
+
+        action_btn = ctk.CTkButton(
+            parent, text=btn_text, height=44, corner_radius=10,
+            fg_color=btn_fg, hover_color=btn_hover,
+            font=ctk.CTkFont(size=15, weight="bold"),
             state="disabled",
         )
-        btn.grid(row=2, column=0, columnspan=3, pady=8)
-        op_buttons.append(btn)
+        action_btn.pack(padx=20, pady=(0, 14))
+        op_buttons.append(action_btn)
 
-        progress = ttk.Progressbar(parent, length=400, mode="determinate")
-        progress.grid(row=3, column=0, columnspan=3, padx=10, pady=4)
+        # progress
+        prog_row = ctk.CTkFrame(parent, fg_color="transparent")
+        prog_row.pack(fill="x", padx=20, pady=(0, 6))
 
-        status_var = tk.StringVar(value="")
-        tk.Label(parent, textvariable=status_var, fg="gray").grid(
-            row=4, column=0, columnspan=3
+        progress_bar = ctk.CTkProgressBar(prog_row, height=16, corner_radius=8)
+        progress_bar.pack(side="left", fill="x", expand=True, padx=(0, 12))
+        progress_bar.set(0)
+
+        pct_label = ctk.CTkLabel(
+            prog_row, text="0 %", width=50,
+            font=ctk.CTkFont(size=12, weight="bold"),
         )
+        pct_label.pack(side="right")
 
-        log_text = tk.Text(
-            parent, height=10, width=54, state="disabled", font=("Courier", 9)
+        # status
+        status_var = ctk.StringVar(value="")
+        ctk.CTkLabel(
+            parent, textvariable=status_var,
+            font=ctk.CTkFont(size=11), text_color="#777",
+        ).pack(anchor="w", padx=20, pady=(0, 4))
+
+        # log
+        log_box = ctk.CTkTextbox(
+            parent, corner_radius=10, state="disabled",
+            font=ctk.CTkFont(family="Consolas", size=11),
         )
-        log_text.grid(row=5, column=0, columnspan=3, padx=10, pady=6)
+        log_box.pack(fill="both", expand=True, padx=20, pady=(0, 16))
 
         def log_msg(msg):
-            log_text.config(state="normal")
-            log_text.insert("end", msg + "\n")
-            log_text.see("end")
-            log_text.config(state="disabled")
-            status_var.set(msg)
+            def _do():
+                log_box.configure(state="normal")
+                log_box.insert("end", msg + "\n")
+                log_box.see("end")
+                log_box.configure(state="disabled")
+                status_var.set(msg)
+            ui(_do)
+
+        def set_progress(v):
+            def _do():
+                progress_bar.set(v / 100)
+                pct_label.configure(text=f"{v:.0f} %")
+            ui(_do)
 
         def do_op():
             cl = client_ref["client"]
             if not cl:
                 messagebox.showerror("Erro", "Conecte ao servidor primeiro.")
                 return
-            local  = local_var.get()
-            remote = remote_var.get()
-            if not local or not remote:
+            local_val = local_entry.get().strip()
+            remote_val = remote_entry.get().strip()
+            if not local_val or not remote_val:
                 messagebox.showerror("Erro", "Preencha as duas pastas.")
                 return
-            save_config({f"{mode}_local": local, f"{mode}_remote": remote})
-            btn.config(state="disabled")
-            log_text.config(state="normal")
-            log_text.delete("1.0", "end")
-            log_text.config(state="disabled")
-            progress["value"] = 0
+            if not remote_val.startswith("/sistemas"):
+                messagebox.showerror(
+                    "Erro", "O caminho remoto deve começar com /sistemas/",
+                )
+                return
+            if not busy_lock.acquire(blocking=False):
+                return
+
+            save_config({f"{mode}_local": local_val, f"{mode}_remote": remote_val})
+            action_btn.configure(state="disabled")
+            log_box.configure(state="normal")
+            log_box.delete("1.0", "end")
+            log_box.configure(state="disabled")
+            set_progress(0)
 
             def _run():
-                fn = push if is_push else pull
-                args = (cl, Path(local), remote) if is_push else (cl, remote, Path(local))
-                fn(*args, log_msg, lambda v: progress.__setitem__("value", v))
-                btn.config(state="normal")
+                try:
+                    if is_push:
+                        push(cl, Path(local_val), remote_val, log_msg, set_progress)
+                    else:
+                        pull(cl, remote_val, Path(local_val), log_msg, set_progress)
+                except Exception as e:
+                    log_msg(f"Erro: {e}")
+                finally:
+                    busy_lock.release()
+                    ui(lambda: action_btn.configure(state="normal"))
 
             threading.Thread(target=_run, daemon=True).start()
 
-        btn.config(command=do_op)
+        action_btn.configure(command=do_op)
 
-    tab_push = ttk.Frame(nb)
-    nb.add(tab_push, text="  Enviar →  ")
-    make_op_tab(tab_push, "push")
+    build_tab(tab_push, "push")
+    build_tab(tab_pull, "pull")
 
-    tab_pull = ttk.Frame(nb)
-    nb.add(tab_pull, text="  ← Receber  ")
-    make_op_tab(tab_pull, "pull")
+    # ── conexão lógica ─────────────────────────────────────────────────────────
 
-    # ── lógica de conexão ─────────────────────────────────────────────────────
-
-    def do_connect():
-        host = host_var.get().rstrip("/")
-        pw   = pw_var.get()
+    def do_connect(_event=None):
+        host = host_entry.get().strip().rstrip("/")
+        pw = pw_entry.get()
         if not host or not pw:
-            messagebox.showerror("Erro", "Preencha o host e a senha.")
+            messagebox.showerror("Erro", "Preencha host e senha.")
             return
-        conn_btn.config(state="disabled")
-        conn_status_var.set("Conectando...")
+        conn_btn.configure(state="disabled")
+        status_dot.configure(text="●  Conectando...", text_color="#E67E22")
 
-        def _connect():
+        def _go():
             try:
                 token = do_auth(host, pw)
                 cl = SyncClient(host, token)
                 client_ref["client"] = cl
                 save_config({"host": host})
-                pw_var.set("")
-                conn_status_var.set(f"Conectado → {host}")
-                conn_btn.config(
-                    text="Desconectar", bg="#f44336", state="normal",
+                ui(lambda: pw_entry.delete(0, "end"))
+                ui(lambda: status_dot.configure(
+                    text=f"●  Conectado → {host}", text_color="#2ECC71",
+                ))
+                ui(lambda: conn_btn.configure(
+                    text="Desconectar", fg_color="#E74C3C",
+                    hover_color="#C0392B", state="normal",
                     command=do_disconnect,
-                )
+                ))
                 for b in op_buttons:
-                    b.config(state="normal")
+                    ui(lambda _b=b: _b.configure(state="normal"))
             except Exception as e:
-                conn_status_var.set(f"Falha: {e}")
-                conn_btn.config(state="normal")
+                ui(lambda: status_dot.configure(
+                    text=f"●  {e}", text_color="#E74C3C",
+                ))
+                ui(lambda: conn_btn.configure(state="normal"))
 
-        threading.Thread(target=_connect, daemon=True).start()
+        threading.Thread(target=_go, daemon=True).start()
 
     def do_disconnect():
         cl = client_ref["client"]
         if cl:
             threading.Thread(target=cl.logout, daemon=True).start()
             client_ref["client"] = None
-        conn_status_var.set("Desconectado.")
-        conn_btn.config(
-            text="Conectar", bg="#FF9800", state="normal", command=do_connect,
+        status_dot.configure(text="●  Desconectado", text_color="#666")
+        conn_btn.configure(
+            text="Conectar", fg_color="#E67E22", hover_color="#D35400",
+            state="normal", command=do_connect,
         )
         for b in op_buttons:
-            b.config(state="disabled")
+            b.configure(state="disabled")
 
-    conn_btn.config(command=do_connect)
+    conn_btn.configure(command=do_connect)
+    pw_entry.bind("<Return>", do_connect)
 
     def on_close():
         do_disconnect()
-        root.after(400, root.destroy)
+        root.after(300, root.destroy)
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
+# ── entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Sincronizador — daemon systemd + GUI Windows.",
+        description="Sincronizador — daemon systemd + GUI desktop.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Exemplos:\n"
             "  Definir senha:     python sincronizador.py setpassword\n"
             "  Daemon (systemd):  python sincronizador.py daemon --port 5000\n"
-            "  GUI (Windows):     python sincronizador.py\n"
-            "  Push (CLI):        python sincronizador.py push /local https://host /remoto --password X\n"
-            "  Pull (CLI):        python sincronizador.py pull https://host /remoto /local --password X\n"
+            "  GUI (desktop):     python sincronizador.py\n"
+            "  Push (CLI):        python sincronizador.py push /local https://host"
+            " /remoto --password X\n"
+            "  Pull (CLI):        python sincronizador.py pull https://host"
+            " /remoto /local --password X\n"
+            "\n  Dica: defina SYNC_PASSWORD para evitar --password no CLI.\n"
         ),
     )
     sub = parser.add_subparsers(dest="mode")
 
     sub.add_parser("setpassword", help="Configurar senha do daemon")
 
-    p_daemon = sub.add_parser("daemon", help="Rodar como daemon always-on")
-    p_daemon.add_argument("--port", type=int, default=5000, help="Porta (padrão: 5000)")
+    p_daemon = sub.add_parser("daemon", help="Rodar como daemon")
+    p_daemon.add_argument("--port", type=int, default=5000)
 
-    p_push = sub.add_parser("push", help="Enviar arquivos locais para o daemon (CLI)")
-    p_push.add_argument("local",        help="Pasta local de origem")
-    p_push.add_argument("host",         help="URL do daemon")
-    p_push.add_argument("remote_dest",  help="Pasta de destino no servidor")
-    p_push.add_argument("--password",   required=True)
+    p_push = sub.add_parser("push", help="Enviar arquivos (CLI)")
+    p_push.add_argument("local")
+    p_push.add_argument("host")
+    p_push.add_argument("remote_dest")
+    p_push.add_argument(
+        "--password", default=os.environ.get("SYNC_PASSWORD", ""),
+    )
 
-    p_pull = sub.add_parser("pull", help="Receber arquivos do daemon (CLI)")
-    p_pull.add_argument("host",         help="URL do daemon")
-    p_pull.add_argument("remote_src",   help="Pasta de origem no servidor")
-    p_pull.add_argument("local_dest",   help="Pasta destino local")
-    p_pull.add_argument("--password",   required=True)
+    p_pull = sub.add_parser("pull", help="Receber arquivos (CLI)")
+    p_pull.add_argument("host")
+    p_pull.add_argument("remote_src")
+    p_pull.add_argument("local_dest")
+    p_pull.add_argument(
+        "--password", default=os.environ.get("SYNC_PASSWORD", ""),
+    )
 
     args = parser.parse_args()
 
@@ -838,26 +1003,29 @@ if __name__ == "__main__":
         run_daemon(args.port)
 
     elif args.mode in ("push", "pull"):
+        pw = args.password
+        if not pw:
+            import getpass
+            pw = getpass.getpass("Senha: ")
         try:
-            token = do_auth(args.host, args.password)
+            token = do_auth(args.host, pw)
         except Exception as e:
             print(f"Autenticação falhou: {e}", file=sys.stderr)
             sys.exit(1)
         cl = SyncClient(args.host, token)
         try:
             if args.mode == "push":
-                push(cl, Path(args.local), args.remote_dest, print)
+                ok = push(cl, Path(args.local), args.remote_dest, print)
             else:
-                pull(cl, args.remote_src, Path(args.local_dest), print)
+                ok = pull(cl, args.remote_src, Path(args.local_dest), print)
+            sys.exit(0 if ok else 1)
         finally:
             cl.logout()
 
     else:
         try:
             run_gui()
-        except Exception as e:
-            print(
-                f"GUI indisponível ({e}). Use: python sincronizador.py --help",
-                file=sys.stderr,
-            )
+        except ImportError as e:
+            print(f"GUI indisponível: {e}", file=sys.stderr)
+            print("  pip install customtkinter", file=sys.stderr)
             sys.exit(1)
