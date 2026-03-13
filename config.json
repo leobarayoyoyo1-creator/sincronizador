@@ -6,6 +6,6 @@
   "host": "https://sync.lbwma.com",
   "push_local": "C:/Users/Leonardo/Documents/codigos/sincronizador/teste",
   "push_remote": "/sistemas/sincronizador",
-  "pull_local": "C:/Users/Leonardo/Documents/codigos/cnn/ml/datasets",
-  "pull_remote": "/sistemas/photos/ml/datasets"
+  "pull_local": "C:/Users/leona/Documents/codigos/cnn/ml",
+  "pull_remote": "/sistemas/photos/ml"
 }
