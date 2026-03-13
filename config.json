@@ -2,5 +2,10 @@
   "server_folder": "C:/Users/Leonardo/Documents/codigos/cnn/ml",
   "port": 52501,
   "server_url": "http://10.150.60.108:52501",
-  "destination": "C:/Users/Leonardo/Documents/teste_envio"
+  "destination": "C:/Users/Leonardo/Documents/teste_envio",
+  "host": "https://sync.lbwma.com",
+  "push_local": "C:/Users/Leonardo/Documents/codigos/sincronizador/tesfdgsdfgs",
+  "push_remote": "/sistemas/sincronizador/teste",
+  "pull_local": "C:/Users/Leonardo/Documents/codigos/cnn/ml/datasets",
+  "pull_remote": "/sistemas/photos/ml/datasets"
 }
