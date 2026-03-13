@@ -1,24 +1,37 @@
 #!/usr/bin/env python3
 """Sincronizador — daemon always-on (systemd) + GUI Windows para push/pull.
 
-Fluxo de autenticação:
-  1. GUI abre → usuário digita host e senha → clica Conectar
-  2. POST /auth com senha → servidor verifica hash → retorna token de sessão
-  3. Todas as rotas exigem header  Authorization: Bearer <token>
-  4. Apenas uma sessão ativa por vez (novo login invalida o anterior)
-  5. Ao fechar a GUI (ou /logout) o servidor descarta o token
+Autenticação : handshake com senha → token de sessão em memória
+Performance  :
+  - Modo archive  (> ARCHIVE_THRESHOLD arquivos): tar.gz em UMA requisição HTTP
+  - Modo paralelo (≤ ARCHIVE_THRESHOLD arquivos): ThreadPoolExecutor
+  - Session pooling: reutilização de conexões TCP/TLS via requests.Session
 """
 
 import argparse
 import hashlib
 import json
+import os
 import secrets
 import sys
+import tarfile
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 from pathlib import Path, PurePosixPath
 
-CONFIG_FILE = Path(__file__).parent / "config.json"
+CONFIG_FILE        = Path(__file__).parent / "config.json"
+PARALLEL_WORKERS   = 8    # conexões simultâneas no modo paralelo
+ARCHIVE_THRESHOLD  = 3    # acima disto usa tar.gz em vez de N requisições individuais
+ARCHIVE_BATCH_SIZE = 500  # arquivos por lote — evita timeout do cloudflare (~100 s)
+
+
+def _fmt_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
 
 
 # ── config ────────────────────────────────────────────────────────────────────
@@ -46,10 +59,15 @@ def hash_password(password: str) -> str:
 # ── daemon Flask ──────────────────────────────────────────────────────────────
 
 def make_daemon_app(password_hash: str):
-    from flask import Flask, jsonify, send_file, abort, request as freq
+    from flask import (
+        Flask, jsonify, send_file, abort,
+        request as freq, Response, stream_with_context,
+    )
 
     app = Flask(__name__)
     app.active_token = None  # única sessão ativa
+
+    # ── auth ──────────────────────────────────────────────────────────────────
 
     def require_auth(f):
         @wraps(f)
@@ -67,11 +85,10 @@ def make_daemon_app(password_hash: str):
     @app.route("/auth", methods=["POST"])
     def auth():
         data = freq.get_json(silent=True) or {}
-        pw = data.get("password", "")
-        if hash_password(pw) != password_hash:
+        if hash_password(data.get("password", "")) != password_hash:
             return jsonify({"error": "Senha incorreta"}), 401
         token = secrets.token_hex(32)
-        app.active_token = token          # invalida sessão anterior automaticamente
+        app.active_token = token   # invalida sessão anterior
         return jsonify({"token": token})
 
     @app.route("/logout", methods=["POST"])
@@ -79,6 +96,8 @@ def make_daemon_app(password_hash: str):
     def logout():
         app.active_token = None
         return jsonify({"ok": True})
+
+    # ── manifesto ─────────────────────────────────────────────────────────────
 
     @app.route("/manifest")
     @require_auth
@@ -88,7 +107,7 @@ def make_daemon_app(password_hash: str):
             abort(400, "path required")
         src = Path(path_str).resolve()
         if not src.exists() or not src.is_dir():
-            return jsonify([])            # destino ainda não existe → lista vazia (push cria)
+            return jsonify([])   # destino inexistente → lista vazia (push cria)
         files = []
         for fp in src.rglob("*"):
             if fp.is_file():
@@ -100,13 +119,12 @@ def make_daemon_app(password_hash: str):
                 })
         return jsonify(files)
 
+    # ── transferência de arquivo único (fallback / poucos arquivos) ───────────
+
     @app.route("/file", methods=["GET"])
     @require_auth
     def get_file():
-        path_str = freq.args.get("path", "")
-        if not path_str:
-            abort(400)
-        p = Path(path_str).resolve()
+        p = Path(freq.args.get("path", "")).resolve()
         if not p.is_file():
             abort(404)
         return send_file(p)
@@ -120,11 +138,76 @@ def make_daemon_app(password_hash: str):
         p = Path(path_str).resolve()
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "wb") as out:
-            while True:
-                chunk = freq.stream.read(65536)
-                if not chunk:
-                    break
+            while chunk := freq.stream.read(65536):
                 out.write(chunk)
+        return jsonify({"ok": True})
+
+    # ── modo archive: tar.gz em uma única requisição ──────────────────────────
+
+    @app.route("/archive", methods=["POST"])
+    @require_auth
+    def get_archive():
+        """Recebe lista de arquivos, devolve tar.gz streamado."""
+        data  = freq.get_json(silent=True) or {}
+        base  = Path(data.get("base", "")).resolve()
+        files = data.get("files", [])
+        if not files or not base.is_dir():
+            abort(400, "base (dir) e files obrigatórios")
+
+        base_str = str(base)
+        r_fd, w_fd = os.pipe()
+
+        def _pack():
+            with os.fdopen(w_fd, "wb") as wf:
+                with tarfile.open(fileobj=wf, mode="w|gz") as tar:
+                    for rel in files:
+                        fp = (base / rel).resolve()
+                        if str(fp).startswith(base_str) and fp.is_file():
+                            tar.add(fp, arcname=rel)
+
+        t = threading.Thread(target=_pack, daemon=True)
+        t.start()
+
+        def _gen():
+            with os.fdopen(r_fd, "rb") as rf:
+                while chunk := rf.read(65536):
+                    yield chunk
+            t.join()
+
+        return Response(stream_with_context(_gen()), mimetype="application/x-tar")
+
+    @app.route("/archive", methods=["PUT"])
+    @require_auth
+    def put_archive():
+        """Recebe tar.gz e extrai na pasta de destino."""
+        dest_str = freq.args.get("path", "")
+        if not dest_str:
+            abort(400, "path required")
+        dest = Path(dest_str).resolve()
+        dest.mkdir(parents=True, exist_ok=True)
+        dest_safe = str(dest)
+
+        with tarfile.open(fileobj=freq.stream, mode="r|gz") as tar:
+            for member in tar:
+                if not (member.isreg() or member.isdir()):
+                    continue
+                if member.name.startswith("/") or ".." in member.name:
+                    continue
+                out = (dest / member.name).resolve()
+                if not str(out).startswith(dest_safe):
+                    continue
+                if member.isdir():
+                    out.mkdir(parents=True, exist_ok=True)
+                else:
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    with tar.extractfile(member) as src, open(out, "wb") as dst:
+                        while chunk := src.read(65536):
+                            dst.write(chunk)
+                    try:
+                        os.utime(out, (member.mtime, member.mtime))
+                    except OSError:
+                        pass
+
         return jsonify({"ok": True})
 
     return app
@@ -143,7 +226,7 @@ def run_daemon(port: int):
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
     print(f"Daemon escutando em http://127.0.0.1:{port}")
     print("Ctrl+C para parar.")
-    app.run(host="127.0.0.1", port=port)
+    app.run(host="127.0.0.1", port=port, threaded=True)
 
 
 def cmd_setpassword():
@@ -152,8 +235,7 @@ def cmd_setpassword():
     if not pw:
         print("Senha não pode ser vazia.", file=sys.stderr)
         sys.exit(1)
-    confirm = getpass.getpass("Confirmar senha: ")
-    if pw != confirm:
+    if pw != getpass.getpass("Confirmar senha: "):
         print("Senhas não conferem.", file=sys.stderr)
         sys.exit(1)
     save_config({"password_hash": hash_password(pw)})
@@ -164,23 +246,37 @@ def cmd_setpassword():
 
 class SyncClient:
     def __init__(self, host: str, token: str):
+        import requests
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+
         self.base = host.rstrip("/")
-        self.headers = {"Authorization": f"Bearer {token}"}
+        self.session = requests.Session()
+        self.session.headers["Authorization"] = f"Bearer {token}"
+
+        # pool de conexões maior + retry automático em falhas de rede
+        adapter = HTTPAdapter(
+            max_retries=Retry(total=3, backoff_factor=0.5,
+                              status_forcelist=[502, 503, 504]),
+            pool_connections=PARALLEL_WORKERS,
+            pool_maxsize=PARALLEL_WORKERS * 2,
+        )
+        self.session.mount("http://",  adapter)
+        self.session.mount("https://", adapter)
+
+    # ── operações individuais (poucos arquivos) ───────────────────────────────
 
     def get_manifest(self, remote_path: str) -> list:
-        import requests
-        r = requests.get(
-            f"{self.base}/manifest", params={"path": remote_path},
-            headers=self.headers, timeout=15,
+        r = self.session.get(
+            f"{self.base}/manifest", params={"path": remote_path}, timeout=15
         )
         r.raise_for_status()
         return r.json()
 
     def download(self, remote_file: str, local_path: Path):
-        import requests
-        r = requests.get(
+        r = self.session.get(
             f"{self.base}/file", params={"path": remote_file},
-            headers=self.headers, stream=True, timeout=120,
+            stream=True, timeout=300,
         )
         r.raise_for_status()
         local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -189,29 +285,138 @@ class SyncClient:
                 f.write(chunk)
 
     def upload(self, local_path: Path, remote_file: str):
-        import requests
         with open(local_path, "rb") as f:
-            r = requests.post(
+            r = self.session.post(
                 f"{self.base}/file", params={"path": remote_file},
-                data=f, headers=self.headers, timeout=120,
+                data=f, timeout=300,
             )
         r.raise_for_status()
 
+    # ── modo archive: tar.gz em UMA requisição ────────────────────────────────
+
+    def download_archive(
+        self, base_path: str, files: list,
+        local_dest: Path, log_fn, progress_fn=None,
+    ):
+        """Baixa múltiplos arquivos como tar.gz — 1 requisição HTTP."""
+        total = len(files)
+        total_size = 0   # acumulado de bytes descomprimidos para exibição
+        log_fn(f"Recebendo {total} arquivo(s)...")
+        if progress_fn:
+            progress_fn(0)
+
+        r = self.session.post(
+            f"{self.base}/archive",
+            json={"base": base_path, "files": files},
+            stream=True, timeout=600,
+        )
+        r.raise_for_status()
+
+        dest_safe = str(local_dest.resolve())
+        r.raw.decode_content = True
+        extracted = 0
+        skipped   = 0
+
+        with tarfile.open(fileobj=r.raw, mode="r|gz") as tar:
+            for member in tar:
+                if not (member.isreg() or member.isdir()):
+                    continue
+                if member.name.startswith("/") or ".." in member.name:
+                    continue
+                out = (local_dest / member.name).resolve()
+                if not str(out).startswith(dest_safe):
+                    continue
+                if member.isdir():
+                    out.mkdir(parents=True, exist_ok=True)
+                    continue
+
+                # Pula se já existe com mesmo tamanho e mtime
+                if out.is_file():
+                    st = out.stat()
+                    if st.st_size == member.size and abs(st.st_mtime - member.mtime) <= 2:
+                        skipped += 1
+                        extracted += 1
+                        if progress_fn:
+                            progress_fn(extracted / total * 100)
+                        continue
+
+                out.parent.mkdir(parents=True, exist_ok=True)
+                with tar.extractfile(member) as src, open(out, "wb") as dst:
+                    while chunk := src.read(65536):
+                        dst.write(chunk)
+                try:
+                    os.utime(out, (member.mtime, member.mtime))
+                except OSError:
+                    pass
+                extracted += 1
+                total_size += member.size
+                log_fn(f"[{extracted}/{total}] {member.name}  ({_fmt_bytes(total_size)})")
+                if progress_fn:
+                    progress_fn(extracted / total * 100)
+
+        if skipped:
+            log_fn(f"  ({skipped} arquivo(s) já existiam, pulados)")
+
+        if progress_fn:
+            progress_fn(100)
+
+    def upload_archive(
+        self, to_upload: list,
+        remote_dest: str, log_fn, progress_fn=None,
+    ):
+        """Envia múltiplos arquivos como tar.gz — 1 requisição HTTP."""
+        total = len(to_upload)
+        total_size = sum(fp.stat().st_size for _, fp in to_upload)
+        log_fn(f"Enviando {total} arquivo(s)  ({_fmt_bytes(total_size)} total)...")
+        if progress_fn:
+            progress_fn(0)
+
+        # pipe: empacotar e enviar em streaming sem carregar tudo na memória.
+        # O _pack roda em thread separada e reporta progresso por arquivo;
+        # como o pipe sincroniza escrita/leitura, o progresso de empacotamento
+        # reflete o progresso real de upload.
+        r_fd, w_fd = os.pipe()
+
+        def _pack():
+            with os.fdopen(w_fd, "wb") as wf:
+                with tarfile.open(fileobj=wf, mode="w|gz") as tar:
+                    for i, (rel, fp) in enumerate(to_upload, 1):
+                        tar.add(str(fp), arcname=rel)
+                        log_fn(f"[{i}/{total}] {rel}  ({_fmt_bytes(fp.stat().st_size)})")
+                        if progress_fn:
+                            progress_fn(i / total * 100)
+
+        pack_thread = threading.Thread(target=_pack, daemon=True)
+        pack_thread.start()
+
+        with os.fdopen(r_fd, "rb") as rf:
+            r = self.session.put(
+                f"{self.base}/archive",
+                params={"path": remote_dest},
+                data=rf,
+                timeout=600,
+            )
+
+        pack_thread.join()
+        r.raise_for_status()
+
+        if progress_fn:
+            progress_fn(100)
+
+    # ─────────────────────────────────────────────────────────────────────────
+
     def logout(self):
-        import requests
         try:
-            requests.post(f"{self.base}/logout", headers=self.headers, timeout=5)
+            self.session.post(f"{self.base}/logout", timeout=5)
         except Exception:
             pass
 
 
 def do_auth(host: str, password: str) -> str:
-    """Autentica e retorna o token. Lança exceção em caso de falha."""
+    """Autentica e retorna o token. Lança ValueError em caso de falha."""
     import requests
     r = requests.post(
-        f"{host.rstrip('/')}/auth",
-        json={"password": password},
-        timeout=10,
+        f"{host.rstrip('/')}/auth", json={"password": password}, timeout=10
     )
     if r.status_code == 401:
         raise ValueError("Senha incorreta.")
@@ -221,8 +426,22 @@ def do_auth(host: str, password: str) -> str:
 
 # ── lógica de sincronização ───────────────────────────────────────────────────
 
+def _diff_manifest(manifest: list, local_dest: Path) -> list:
+    """Retorna itens do manifesto que diferem do estado local."""
+    to_get = []
+    for item in manifest:
+        local = local_dest / item["path"]
+        if not local.exists():
+            to_get.append(item)
+        else:
+            st = local.stat()
+            if st.st_size != item["size"] or abs(st.st_mtime - item["mtime"]) > 1:
+                to_get.append(item)
+    return to_get
+
+
 def pull(client: SyncClient, remote_path: str, local_dest: Path, log_fn, progress_fn=None):
-    """Baixa arquivos do daemon (remote_path) para local_dest."""
+    """Baixa arquivos do daemon (remote_path) → local_dest."""
     log_fn("Buscando lista de arquivos...")
     try:
         manifest = client.get_manifest(remote_path)
@@ -230,38 +449,77 @@ def pull(client: SyncClient, remote_path: str, local_dest: Path, log_fn, progres
         log_fn(f"Erro ao conectar: {e}")
         return False
 
-    to_download = []
-    for item in manifest:
-        local = local_dest / item["path"]
-        if not local.exists():
-            to_download.append(item)
-        else:
-            st = local.stat()
-            if st.st_size != item["size"] or abs(st.st_mtime - item["mtime"]) > 1:
-                to_download.append(item)
-
+    to_download = _diff_manifest(manifest, local_dest)
     total, to_dl = len(manifest), len(to_download)
     log_fn(f"{total} arquivo(s) no servidor — {to_dl} para baixar.")
+
     if to_dl == 0:
         log_fn("Tudo já sincronizado!")
+        if progress_fn:
+            progress_fn(100)
         return True
 
-    for i, item in enumerate(to_download, 1):
-        remote_file = str(PurePosixPath(remote_path) / item["path"])
-        log_fn(f"[{i}/{to_dl}] {item['path']}")
-        try:
+    if to_dl > ARCHIVE_THRESHOLD:
+        # ── modo archive em lotes — evita timeout do cloudflare ──────────────
+        files    = [item["path"] for item in to_download]
+        batches  = [files[i:i + ARCHIVE_BATCH_SIZE]
+                    for i in range(0, to_dl, ARCHIVE_BATCH_SIZE)]
+        n_batches = len(batches)
+        done_files = 0
+
+        for batch_num, batch in enumerate(batches, 1):
+            if n_batches > 1:
+                log_fn(f"── Lote {batch_num}/{n_batches} ({len(batch)} arquivo(s)) ──")
+
+            base_done = done_files
+            batch_len = len(batch)
+
+            def _batch_pfn(v, _b=base_done, _l=batch_len):
+                if progress_fn:
+                    progress_fn((_b + _l * v / 100) / to_dl * 100)
+
+            for attempt in range(2):
+                try:
+                    client.download_archive(remote_path, batch, local_dest, log_fn, _batch_pfn)
+                    break
+                except Exception as e:
+                    if attempt == 0:
+                        log_fn(f"  Falha, tentando novamente... ({e})")
+                    else:
+                        log_fn(f"  Erro no lote {batch_num}: {e}")
+                        return False
+
+            done_files += batch_len
+
+    else:
+        # ── modo paralelo: até PARALLEL_WORKERS downloads simultâneos ────────
+        done = [0]
+        lock = threading.Lock()
+
+        def _one(item):
+            remote_file = str(PurePosixPath(remote_path) / item["path"])
             client.download(remote_file, local_dest / item["path"])
-            if progress_fn:
-                progress_fn(i / to_dl * 100)
-        except Exception as e:
-            log_fn(f"  Erro: {e}")
+            with lock:
+                done[0] += 1
+                return done[0], item["path"]
+
+        with ThreadPoolExecutor(max_workers=min(PARALLEL_WORKERS, to_dl)) as ex:
+            futures = {ex.submit(_one, item): item for item in to_download}
+            for fut in as_completed(futures):
+                try:
+                    n, path = fut.result()
+                    log_fn(f"[{n}/{to_dl}] {path}")
+                    if progress_fn:
+                        progress_fn(n / to_dl * 100)
+                except Exception as e:
+                    log_fn(f"  Erro: {e}")
 
     log_fn("Concluído!")
     return True
 
 
 def push(client: SyncClient, local_source: Path, remote_dest: str, log_fn, progress_fn=None):
-    """Envia arquivos de local_source para o daemon (remote_dest)."""
+    """Envia arquivos de local_source → daemon (remote_dest)."""
     src = local_source.resolve()
     local_files = {
         fp.relative_to(src).as_posix(): fp
@@ -272,7 +530,7 @@ def push(client: SyncClient, local_source: Path, remote_dest: str, log_fn, progr
     try:
         remote_index = {item["path"]: item for item in client.get_manifest(remote_dest)}
     except Exception:
-        remote_index = {}   # destino não existe ainda — envia tudo
+        remote_index = {}
 
     to_upload = []
     for rel, fp in local_files.items():
@@ -286,19 +544,66 @@ def push(client: SyncClient, local_source: Path, remote_dest: str, log_fn, progr
 
     total, to_ul = len(local_files), len(to_upload)
     log_fn(f"{total} arquivo(s) — {to_ul} para enviar.")
+
     if to_ul == 0:
         log_fn("Tudo já sincronizado!")
+        if progress_fn:
+            progress_fn(100)
         return True
 
-    for i, (rel, fp) in enumerate(to_upload, 1):
-        remote_file = str(PurePosixPath(remote_dest) / rel)
-        log_fn(f"[{i}/{to_ul}] {rel}")
-        try:
-            client.upload(fp, remote_file)
-            if progress_fn:
-                progress_fn(i / to_ul * 100)
-        except Exception as e:
-            log_fn(f"  Erro: {e}")
+    if to_ul > ARCHIVE_THRESHOLD:
+        # ── modo archive em lotes — evita timeout do cloudflare ──────────────
+        batches   = [to_upload[i:i + ARCHIVE_BATCH_SIZE]
+                     for i in range(0, to_ul, ARCHIVE_BATCH_SIZE)]
+        n_batches = len(batches)
+        done_files = 0
+
+        for batch_num, batch in enumerate(batches, 1):
+            if n_batches > 1:
+                log_fn(f"── Lote {batch_num}/{n_batches} ({len(batch)} arquivo(s)) ──")
+
+            base_done = done_files
+            batch_len = len(batch)
+
+            def _batch_pfn(v, _b=base_done, _l=batch_len):
+                if progress_fn:
+                    progress_fn((_b + _l * v / 100) / to_ul * 100)
+
+            for attempt in range(2):
+                try:
+                    client.upload_archive(batch, remote_dest, log_fn, _batch_pfn)
+                    break
+                except Exception as e:
+                    if attempt == 0:
+                        log_fn(f"  Falha, tentando novamente... ({e})")
+                    else:
+                        log_fn(f"  Erro no lote {batch_num}: {e}")
+                        return False
+
+            done_files += batch_len
+
+    else:
+        # ── modo paralelo ─────────────────────────────────────────────────────
+        done = [0]
+        lock = threading.Lock()
+
+        def _one(item):
+            rel, fp = item
+            client.upload(fp, str(PurePosixPath(remote_dest) / rel))
+            with lock:
+                done[0] += 1
+                return done[0], rel
+
+        with ThreadPoolExecutor(max_workers=min(PARALLEL_WORKERS, to_ul)) as ex:
+            futures = {ex.submit(_one, item): item for item in to_upload}
+            for fut in as_completed(futures):
+                try:
+                    n, rel = fut.result()
+                    log_fn(f"[{n}/{to_ul}] {rel}")
+                    if progress_fn:
+                        progress_fn(n / to_ul * 100)
+                except Exception as e:
+                    log_fn(f"  Erro: {e}")
 
     log_fn("Concluído!")
     return True
@@ -354,7 +659,7 @@ def run_gui():
     def make_op_tab(parent, mode):
         is_push = mode == "push"
 
-        lbl_local  = "Pasta local (origem):"   if is_push else "Pasta local (destino):"
+        lbl_local  = "Pasta local (origem):"    if is_push else "Pasta local (destino):"
         lbl_remote = "Pasta no Linux (destino):" if is_push else "Pasta no Linux (origem):"
 
         tk.Label(parent, text=lbl_local).grid(row=0, column=0, sticky="w", **pad)
@@ -407,7 +712,7 @@ def run_gui():
             if not cl:
                 messagebox.showerror("Erro", "Conecte ao servidor primeiro.")
                 return
-            local = local_var.get()
+            local  = local_var.get()
             remote = remote_var.get()
             if not local or not remote:
                 messagebox.showerror("Erro", "Preencha as duas pastas.")
@@ -419,14 +724,10 @@ def run_gui():
             log_text.config(state="disabled")
             progress["value"] = 0
 
-            def _set_progress(val):
-                progress["value"] = val
-
             def _run():
-                if is_push:
-                    push(cl, Path(local), remote, log_msg, _set_progress)
-                else:
-                    pull(cl, remote, Path(local), log_msg, _set_progress)
+                fn = push if is_push else pull
+                args = (cl, Path(local), remote) if is_push else (cl, remote, Path(local))
+                fn(*args, log_msg, lambda v: progress.__setitem__("value", v))
                 btn.config(state="normal")
 
             threading.Thread(target=_run, daemon=True).start()
@@ -445,7 +746,7 @@ def run_gui():
 
     def do_connect():
         host = host_var.get().rstrip("/")
-        pw = pw_var.get()
+        pw   = pw_var.get()
         if not host or not pw:
             messagebox.showerror("Erro", "Preencha o host e a senha.")
             return
@@ -479,8 +780,7 @@ def run_gui():
             client_ref["client"] = None
         conn_status_var.set("Desconectado.")
         conn_btn.config(
-            text="Conectar", bg="#FF9800", state="normal",
-            command=do_connect,
+            text="Conectar", bg="#FF9800", state="normal", command=do_connect,
         )
         for b in op_buttons:
             b.config(state="disabled")
@@ -489,7 +789,7 @@ def run_gui():
 
     def on_close():
         do_disconnect()
-        root.after(400, root.destroy)   # aguarda logout disparar antes de fechar
+        root.after(400, root.destroy)
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
@@ -518,16 +818,16 @@ if __name__ == "__main__":
     p_daemon.add_argument("--port", type=int, default=5000, help="Porta (padrão: 5000)")
 
     p_push = sub.add_parser("push", help="Enviar arquivos locais para o daemon (CLI)")
-    p_push.add_argument("local", help="Pasta local de origem")
-    p_push.add_argument("host", help="URL do daemon  ex: https://tunnel.example.com")
-    p_push.add_argument("remote_dest", help="Pasta de destino no servidor")
-    p_push.add_argument("--password", required=True, help="Senha do daemon")
+    p_push.add_argument("local",        help="Pasta local de origem")
+    p_push.add_argument("host",         help="URL do daemon")
+    p_push.add_argument("remote_dest",  help="Pasta de destino no servidor")
+    p_push.add_argument("--password",   required=True)
 
     p_pull = sub.add_parser("pull", help="Receber arquivos do daemon (CLI)")
-    p_pull.add_argument("host", help="URL do daemon  ex: https://tunnel.example.com")
-    p_pull.add_argument("remote_src", help="Pasta de origem no servidor")
-    p_pull.add_argument("local_dest", help="Pasta destino local")
-    p_pull.add_argument("--password", required=True, help="Senha do daemon")
+    p_pull.add_argument("host",         help="URL do daemon")
+    p_pull.add_argument("remote_src",   help="Pasta de origem no servidor")
+    p_pull.add_argument("local_dest",   help="Pasta destino local")
+    p_pull.add_argument("--password",   required=True)
 
     args = parser.parse_args()
 
