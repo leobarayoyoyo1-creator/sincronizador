@@ -4,8 +4,8 @@
   "server_url": "http://10.150.60.108:52501",
   "destination": "C:/Users/Leonardo/Documents/teste_envio",
   "host": "https://sync.lbwma.com",
-  "push_local": "C:/Users/Leonardo/Documents/codigos/sincronizador/teste",
-  "push_remote": "/sistemas/sincronizador",
+  "push_local": "C:/Users/Leonardo/Documents/codigos/cnn/apk/app/build/outputs/apk/release",
+  "push_remote": "/sistemas/photos/server",
   "pull_local": "C:/Users/Leonardo/Documents/codigos/cnn/ml/datasets",
   "pull_remote": "/sistemas/photos/ml/datasets"
 }
