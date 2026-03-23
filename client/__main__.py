@@ -1,3 +1,3 @@
-from client.desktop import main
+from .desktop import main
 
 main()
