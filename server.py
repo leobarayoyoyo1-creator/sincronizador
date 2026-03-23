@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-"""Sincronizador — servidor (daemon systemd).
-Arquivo único, copia pro servidor e roda. Sem dependência de pacote local.
-
-Dependências: pip install flask zstandard waitress
-
-Uso:
-  python server.py setpassword
-  python server.py daemon --port 5000
-  python server.py daemon --port 5000 --bind 0.0.0.0
-"""
-
 import argparse
 import hashlib
 import hmac
