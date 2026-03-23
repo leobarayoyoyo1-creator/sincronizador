@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['desktop.py'],
+    ['client/desktop.py'],
     pathex=[],
     binaries=[],
     datas=[],

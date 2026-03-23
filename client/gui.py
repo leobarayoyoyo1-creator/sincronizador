@@ -4,7 +4,7 @@ import threading
 import time
 from pathlib import Path
 
-from .client import SyncClient, do_auth
+from .http import SyncClient, do_auth
 from .config import load_config, save_config
 from .constants import MAX_LOG_LINES
 from .sync_logic import pull, push

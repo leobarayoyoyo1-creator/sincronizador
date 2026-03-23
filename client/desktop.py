@@ -48,8 +48,8 @@ def main():
     args = parser.parse_args()
 
     if args.mode in ("push", "pull"):
-        from core.client import SyncClient, do_auth
-        from core.sync_logic import pull, push
+        from .http import SyncClient, do_auth
+        from .sync_logic import pull, push
 
         pw = args.password
         if not pw:
@@ -73,7 +73,7 @@ def main():
 
     else:
         try:
-            from core.gui import run_gui
+            from .gui import run_gui
             run_gui()
         except ImportError as e:
             print(f"GUI indisponível: {e}", file=sys.stderr)
