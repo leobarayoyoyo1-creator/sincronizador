@@ -1,0 +1,3 @@
+exagero ter criado? talvez, sei que existem coisas que fazem mais ou menos a mesma coisa, mas nada que realmente fosse facil pra quantia de vezes que eu ia ficar enviando documentos entre no minimo 4 computadores e o servidor
+
+criei esse sistema na primeira intenção de ser pela minha [IA](https://github.com/leobarayoyoyo1-creator/cnn-photo-apk), para enviar as imagens de treino entre o servidor que recebe elas via [aplicativo](https://github.com/leobarayoyoyo1-creator/cnn-photo-apk) que fiz para facilitar o tirar as fotos e meu computador pessoal em casa, que tem o hardware necessario para eu treina-la

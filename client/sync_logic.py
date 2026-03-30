@@ -7,7 +7,7 @@ from pathlib import Path, PurePosixPath
 
 import requests
 
-from .constants import ARCHIVE_BATCH_SIZE, ARCHIVE_THRESHOLD, MTIME_TOLERANCE, PARALLEL_WORKERS
+from .constants import ARCHIVE_BATCH_MAX_BYTES, ARCHIVE_BATCH_SIZE, ARCHIVE_THRESHOLD, MTIME_TOLERANCE, PARALLEL_WORKERS
 from .utils import fmt_bytes
 
 
@@ -25,10 +25,27 @@ def _diff_manifest(manifest: list, local_dest: Path) -> list:
     return to_get
 
 
-def _run_batched(items, batch_size, batch_fn, log_fn, progress_fn, cancel):
+def _make_batches(items, max_count, max_bytes, size_fn):
+    batches, current, current_bytes = [], [], 0
+    for item in items:
+        sz = size_fn(item)
+        if current and (len(current) >= max_count or current_bytes + sz > max_bytes):
+            batches.append(current)
+            current, current_bytes = [], 0
+        current.append(item)
+        current_bytes += sz
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _run_batched(items, batch_size, batch_fn, log_fn, progress_fn, cancel, size_fn=None):
     """Executa batch_fn em lotes com retry, backoff e progresso."""
     total = len(items)
-    batches = [items[i:i + batch_size] for i in range(0, total, batch_size)]
+    if size_fn:
+        batches = _make_batches(items, batch_size, ARCHIVE_BATCH_MAX_BYTES, size_fn)
+    else:
+        batches = [items[i:i + batch_size] for i in range(0, total, batch_size)]
     done = 0
     for bn, batch in enumerate(batches, 1):
         if cancel and cancel.is_set():
@@ -138,7 +155,7 @@ def pull(client, remote_path, local_dest, log_fn, progress_fn=None, cancel=None)
     return True
 
 
-def push(client, local_source, remote_dest, log_fn, progress_fn=None, cancel=None):
+def push(client, local_source, remote_dest, log_fn, progress_fn=None, cancel=None, exclude=None):
     src = Path(local_source).resolve()
 
     # Coleta arquivos locais com stat cacheado
@@ -147,6 +164,8 @@ def push(client, local_source, remote_dest, log_fn, progress_fn=None, cancel=Non
         if fp.is_file():
             st = fp.stat()
             rel = fp.relative_to(src).as_posix()
+            if exclude and any(rel == ex or rel.startswith(ex + "/") for ex in exclude):
+                continue
             local_files[rel] = (fp, st.st_size, st.st_mtime)
 
     log_fn("Verificando remotos...")
@@ -185,7 +204,8 @@ def push(client, local_source, remote_dest, log_fn, progress_fn=None, cancel=Non
         def batch_fn(batch, lfn, pfn):
             client.upload_archive(batch, remote_dest, lfn, pfn)
 
-        if not _run_batched(to_upload, ARCHIVE_BATCH_SIZE, batch_fn, log_fn, progress_fn, cancel):
+        if not _run_batched(to_upload, ARCHIVE_BATCH_SIZE, batch_fn, log_fn, progress_fn, cancel,
+                            size_fn=lambda item: item[2]):
             return False
     else:
         def one_fn(item):

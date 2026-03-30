@@ -220,6 +220,75 @@ def run_gui():
                 pct_label.configure(text=f"{v:.0f} %{extra}")
             ui(_do)
 
+        def _show_filter_dialog(local_val, on_confirm):
+            src = Path(local_val)
+            try:
+                entries = sorted(src.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+            except OSError as e:
+                messagebox.showerror("Erro", f"Não foi possível ler a pasta:\n{e}")
+                return
+
+            dialog = ctk.CTkToplevel(root)
+            dialog.title("Filtrar arquivos")
+            dialog.geometry("460x480")
+            dialog.resizable(False, True)
+            dialog.grab_set()
+            dialog.transient(root)
+
+            ctk.CTkLabel(
+                dialog, text="Desmarque o que não deve ser enviado:",
+                font=ctk.CTkFont(size=13),
+            ).pack(anchor="w", padx=20, pady=(16, 6))
+
+            # botões selecionar / desmarcar todos
+            sel_row = ctk.CTkFrame(dialog, fg_color="transparent")
+            sel_row.pack(fill="x", padx=20, pady=(0, 8))
+            ctk.CTkLabel(sel_row, text="Selecionar:", font=ctk.CTkFont(size=11), text_color="#888").pack(side="left")
+
+            checks: list[tuple[ctk.CTkCheckBox, ctk.BooleanVar, str]] = []
+
+            def _set_all(val):
+                for _, var, _ in checks:
+                    var.set(val)
+
+            ctk.CTkButton(sel_row, text="Todos", width=70, height=26,
+                          command=lambda: _set_all(True)).pack(side="left", padx=(8, 4))
+            ctk.CTkButton(sel_row, text="Nenhum", width=70, height=26,
+                          command=lambda: _set_all(False)).pack(side="left")
+
+            # lista com scroll
+            scroll = ctk.CTkScrollableFrame(dialog, corner_radius=8)
+            scroll.pack(fill="both", expand=True, padx=20, pady=(0, 12))
+
+            for entry in entries:
+                var = ctk.BooleanVar(value=True)
+                icon = "📁  " if entry.is_dir() else "📄  "
+                name = entry.name + ("/" if entry.is_dir() else "")
+                cb = ctk.CTkCheckBox(scroll, text=f"{icon}{name}", variable=var,
+                                     font=ctk.CTkFont(size=12))
+                cb.pack(anchor="w", pady=2)
+                checks.append((cb, var, entry.name))
+
+            # botões confirmar / cancelar
+            btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+            btn_row.pack(fill="x", padx=20, pady=(0, 16))
+
+            def _cancel():
+                dialog.destroy()
+
+            def _confirm():
+                excluded = {name for _, var, name in checks if not var.get()}
+                dialog.destroy()
+                on_confirm(excluded)
+
+            ctk.CTkButton(btn_row, text="Cancelar", width=110, height=36,
+                          fg_color="#555", hover_color="#444",
+                          command=_cancel).pack(side="left")
+            ctk.CTkButton(btn_row, text="Confirmar envio", height=36,
+                          fg_color="#2980B9", hover_color="#2471A3",
+                          font=ctk.CTkFont(size=13, weight="bold"),
+                          command=_confirm).pack(side="right")
+
         def do_op():
             cl = client_ref["client"]
             if not cl:
@@ -239,32 +308,39 @@ def run_gui():
                 messagebox.showinfo("Aguarde", "Operação em andamento.")
                 return
 
-            cancel_event.clear()
-            save_config({f"{mode}_local": local_val, f"{mode}_remote": remote_val})
-            action_btn.configure(state="disabled")
-            cancel_btn.configure(state="normal")
-            log_box.configure(state="normal")
-            log_box.delete("1.0", "end")
-            log_box.configure(state="disabled")
-            set_progress(0)
-            start_time[0] = time.monotonic()
+            def _start(exclude):
+                cancel_event.clear()
+                save_config({f"{mode}_local": local_val, f"{mode}_remote": remote_val})
+                action_btn.configure(state="disabled")
+                cancel_btn.configure(state="normal")
+                log_box.configure(state="normal")
+                log_box.delete("1.0", "end")
+                log_box.configure(state="disabled")
+                set_progress(0)
+                start_time[0] = time.monotonic()
 
-            def _run():
-                try:
-                    if is_push:
-                        push(cl, Path(local_val), remote_val, log_msg, set_progress, cancel_event)
-                    else:
-                        pull(cl, remote_val, Path(local_val), log_msg, set_progress, cancel_event)
-                except Exception as e:
-                    log_msg(f"Erro: {e}")
-                finally:
-                    elapsed = time.monotonic() - start_time[0]
-                    log_msg(f"Tempo total: {fmt_eta(elapsed)}")
-                    busy_lock.release()
-                    ui(lambda: action_btn.configure(state="normal"))
-                    ui(lambda: cancel_btn.configure(state="disabled"))
+                def _run():
+                    try:
+                        if is_push:
+                            push(cl, Path(local_val), remote_val, log_msg, set_progress, cancel_event,
+                                 exclude=exclude or None)
+                        else:
+                            pull(cl, remote_val, Path(local_val), log_msg, set_progress, cancel_event)
+                    except Exception as e:
+                        log_msg(f"Erro: {e}")
+                    finally:
+                        elapsed = time.monotonic() - start_time[0]
+                        log_msg(f"Tempo total: {fmt_eta(elapsed)}")
+                        busy_lock.release()
+                        ui(lambda: action_btn.configure(state="normal"))
+                        ui(lambda: cancel_btn.configure(state="disabled"))
 
-            threading.Thread(target=_run, daemon=True).start()
+                threading.Thread(target=_run, daemon=True).start()
+
+            if is_push:
+                _show_filter_dialog(local_val, _start)
+            else:
+                _start(set())
 
         def do_cancel():
             cancel_event.set()

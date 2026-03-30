@@ -1,5 +1,7 @@
 {
   "host": "https://sync.lbwma.com",
-  "push_local": "C:/Users/Leonardo/Documents/codigos/cnn/apk/app/build/outputs/apk/release",
-  "push_remote": "/sistemas/photos/server"
+  "push_local": "C:/Users/Leonardo/Documents/codigos/cnn/ml",
+  "push_remote": "/sistemas/photos/ml",
+  "pull_local": "C:/Users/Leonardo/Documents/codigos/cnn/ml/datasets",
+  "pull_remote": "/sistemas/photos/ml/datasets"
 }
