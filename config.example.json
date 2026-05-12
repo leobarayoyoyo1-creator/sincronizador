@@ -1,0 +1,7 @@
+{
+  "host": "https://sync.exemplo.com",
+  "push_local": "C:/caminho/para/pasta/local",
+  "push_remote": "/sistemas/destino",
+  "pull_local": "C:/caminho/para/destino/local",
+  "pull_remote": "/sistemas/origem"
+}

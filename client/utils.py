@@ -1,9 +1,13 @@
-def fmt_bytes(n: int) -> str:
+def fmt_bytes(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024:
             return f"{n:.0f} {unit}"
         n /= 1024
     return f"{n:.1f} TB"
+
+
+def fmt_speed(bytes_per_sec: float) -> str:
+    return f"{fmt_bytes(bytes_per_sec)}/s"
 
 
 def fmt_eta(seconds: float) -> str:

@@ -1,19 +1,26 @@
 """GUI desktop com customtkinter."""
 
+import queue
 import threading
 import time
 from pathlib import Path
 
-from .http import SyncClient, do_auth
 from .config import load_config, save_config
 from .constants import MAX_LOG_LINES
+from .http import SyncClient, do_auth
+from .logger import get_logger, log_dir, setup_file_logging
 from .sync_logic import pull, push
-from .utils import fmt_eta
+from .utils import fmt_bytes, fmt_eta, fmt_speed
 
 
 def run_gui():
-    import customtkinter as ctk
     from tkinter import filedialog, messagebox
+
+    import customtkinter as ctk
+
+    log_file = setup_file_logging()
+    log = get_logger()
+    log.info("GUI iniciada")
 
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
@@ -46,6 +53,28 @@ def run_gui():
         header, text="zstd + tar streaming",
         font=ctk.CTkFont(size=12), text_color="#666",
     ).pack(side="left", padx=(12, 0), pady=(6, 0))
+
+    def open_log_dir():
+        import os
+        import subprocess
+        import sys
+        try:
+            d = log_dir()
+            if sys.platform == "win32":
+                os.startfile(str(d))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(d)])
+            else:
+                subprocess.Popen(["xdg-open", str(d)])
+        except Exception as e:
+            messagebox.showerror("Erro", f"Não foi possível abrir pasta de logs:\n{e}")
+
+    ctk.CTkButton(
+        header, text="Logs", width=60, height=26,
+        fg_color="transparent", border_width=1, border_color="#555",
+        text_color="#888", hover_color="#222",
+        command=open_log_dir,
+    ).pack(side="right", pady=(8, 0))
 
     # ── conexão ────────────────────────────────────────────────────────────────
 
@@ -100,7 +129,6 @@ def run_gui():
         lbl_local = "Pasta local (origem)" if is_push else "Pasta local (destino)"
         lbl_remote = "Pasta remota (destino)" if is_push else "Pasta remota (origem)"
 
-        # local path
         ctk.CTkLabel(
             parent, text=lbl_local, font=ctk.CTkFont(size=12),
         ).pack(anchor="w", padx=20, pady=(14, 3))
@@ -124,7 +152,6 @@ def run_gui():
             local_row, text="Procurar", width=100, command=_browse,
         ).pack(side="right")
 
-        # remote path
         ctk.CTkLabel(
             parent, text=lbl_remote, font=ctk.CTkFont(size=12),
         ).pack(anchor="w", padx=20, pady=(2, 3))
@@ -136,7 +163,6 @@ def run_gui():
         if cfg.get(f"{mode}_remote"):
             remote_entry.insert(0, cfg[f"{mode}_remote"])
 
-        # botões ação + cancelar
         if is_push:
             btn_fg, btn_hover = "#2980B9", "#2471A3"
             btn_text = "Enviar  →"
@@ -164,7 +190,6 @@ def run_gui():
         )
         cancel_btn.pack(side="right")
 
-        # progresso
         prog_row = ctk.CTkFrame(parent, fg_color="transparent")
         prog_row.pack(fill="x", padx=20, pady=(0, 6))
 
@@ -173,51 +198,82 @@ def run_gui():
         progress_bar.set(0)
 
         pct_label = ctk.CTkLabel(
-            prog_row, text="0 %", width=130,
+            prog_row, text="0 %", width=200,
             font=ctk.CTkFont(size=12, weight="bold"),
             anchor="e",
         )
         pct_label.pack(side="right")
 
-        # status
         status_var = ctk.StringVar(value="")
         ctk.CTkLabel(
             parent, textvariable=status_var,
             font=ctk.CTkFont(size=11), text_color="#777",
         ).pack(anchor="w", padx=20, pady=(0, 4))
 
-        # log
         log_box = ctk.CTkTextbox(
             parent, corner_radius=10, state="disabled",
             font=ctk.CTkFont(family="Consolas", size=11),
         )
         log_box.pack(fill="both", expand=True, padx=20, pady=(0, 16))
 
+        # ── batch de logs para evitar floods no event loop ────────────────────
+        log_queue: queue.SimpleQueue = queue.SimpleQueue()
+        flush_scheduled = [False]
+
+        def _flush_logs():
+            flush_scheduled[0] = False
+            msgs = []
+            try:
+                while True:
+                    msgs.append(log_queue.get_nowait())
+            except queue.Empty:
+                pass
+            if not msgs:
+                return
+            log_box.configure(state="normal")
+            log_box.insert("end", "\n".join(msgs) + "\n")
+            line_count = int(log_box.index("end-1c").split(".")[0])
+            if line_count > MAX_LOG_LINES:
+                log_box.delete("1.0", f"{line_count - MAX_LOG_LINES}.0")
+            log_box.see("end")
+            log_box.configure(state="disabled")
+            status_var.set(msgs[-1])
+
         def log_msg(msg):
-            def _do():
-                log_box.configure(state="normal")
-                log_box.insert("end", msg + "\n")
-                # Limita número de linhas para não crescer infinitamente
-                line_count = int(log_box.index("end-1c").split(".")[0])
-                if line_count > MAX_LOG_LINES:
-                    log_box.delete("1.0", f"{line_count - MAX_LOG_LINES}.0")
-                log_box.see("end")
-                log_box.configure(state="disabled")
-                status_var.set(msg)
-            ui(_do)
+            log.info("[%s] %s", mode, msg)
+            log_queue.put(msg)
+            if not flush_scheduled[0]:
+                flush_scheduled[0] = True
+                ui(_flush_logs)
 
-        start_time = [0.0]
+        # ── progresso: %, ETA, MB/s ───────────────────────────────────────────
+        op_state = {"start_time": 0.0, "bytes_target": 0, "last_update": 0.0}
 
-        def set_progress(v):
-            elapsed = time.monotonic() - start_time[0]
-            if v > 0 and elapsed > 2:
+        def set_total_bytes(n: int):
+            op_state["bytes_target"] = n
+
+        def set_progress(v: float):
+            now = time.monotonic()
+            # throttle: 10 Hz max para não inundar event loop
+            if v < 100 and now - op_state["last_update"] < 0.1:
+                return
+            op_state["last_update"] = now
+
+            elapsed = now - op_state["start_time"]
+            parts = [f"{v:.0f} %"]
+            target = op_state["bytes_target"]
+            if v > 0 and elapsed > 1:
                 eta = elapsed / v * (100 - v)
-                extra = f"  ETA {fmt_eta(eta)}"
-            else:
-                extra = ""
+                parts.append(f"ETA {fmt_eta(eta)}")
+                if target > 0:
+                    bytes_done = target * v / 100
+                    speed = bytes_done / elapsed
+                    parts.append(fmt_speed(speed))
+            text = "  •  ".join(parts)
+
             def _do():
                 progress_bar.set(v / 100)
-                pct_label.configure(text=f"{v:.0f} %{extra}")
+                pct_label.configure(text=text)
             ui(_do)
 
         def _show_filter_dialog(local_val, on_confirm):
@@ -240,7 +296,6 @@ def run_gui():
                 font=ctk.CTkFont(size=13),
             ).pack(anchor="w", padx=20, pady=(16, 6))
 
-            # botões selecionar / desmarcar todos
             sel_row = ctk.CTkFrame(dialog, fg_color="transparent")
             sel_row.pack(fill="x", padx=20, pady=(0, 8))
             ctk.CTkLabel(sel_row, text="Selecionar:", font=ctk.CTkFont(size=11), text_color="#888").pack(side="left")
@@ -256,20 +311,18 @@ def run_gui():
             ctk.CTkButton(sel_row, text="Nenhum", width=70, height=26,
                           command=lambda: _set_all(False)).pack(side="left")
 
-            # lista com scroll
             scroll = ctk.CTkScrollableFrame(dialog, corner_radius=8)
             scroll.pack(fill="both", expand=True, padx=20, pady=(0, 12))
 
             for entry in entries:
                 var = ctk.BooleanVar(value=True)
-                icon = "📁  " if entry.is_dir() else "📄  "
+                icon = "[D]  " if entry.is_dir() else "[F]  "
                 name = entry.name + ("/" if entry.is_dir() else "")
                 cb = ctk.CTkCheckBox(scroll, text=f"{icon}{name}", variable=var,
                                      font=ctk.CTkFont(size=12))
                 cb.pack(anchor="w", pady=2)
                 checks.append((cb, var, entry.name))
 
-            # botões confirmar / cancelar
             btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
             btn_row.pack(fill="x", padx=20, pady=(0, 16))
 
@@ -316,21 +369,28 @@ def run_gui():
                 log_box.configure(state="normal")
                 log_box.delete("1.0", "end")
                 log_box.configure(state="disabled")
+                op_state["bytes_target"] = 0
+                op_state["last_update"] = 0.0
                 set_progress(0)
-                start_time[0] = time.monotonic()
+                op_state["start_time"] = time.monotonic()
 
                 def _run():
                     try:
                         if is_push:
-                            push(cl, Path(local_val), remote_val, log_msg, set_progress, cancel_event,
-                                 exclude=exclude or None)
+                            push(cl, Path(local_val), remote_val, log_msg, set_progress,
+                                 cancel_event, exclude=exclude or None,
+                                 total_bytes_fn=set_total_bytes)
                         else:
-                            pull(cl, remote_val, Path(local_val), log_msg, set_progress, cancel_event)
+                            pull(cl, remote_val, Path(local_val), log_msg, set_progress,
+                                 cancel_event, total_bytes_fn=set_total_bytes)
                     except Exception as e:
                         log_msg(f"Erro: {e}")
+                        log.exception("Erro na operação %s", mode)
                     finally:
-                        elapsed = time.monotonic() - start_time[0]
-                        log_msg(f"Tempo total: {fmt_eta(elapsed)}")
+                        elapsed = time.monotonic() - op_state["start_time"]
+                        target = op_state["bytes_target"]
+                        suffix = f" ({fmt_bytes(target)})" if target else ""
+                        log_msg(f"Tempo total: {fmt_eta(elapsed)}{suffix}")
                         busy_lock.release()
                         ui(lambda: action_btn.configure(state="normal"))
                         ui(lambda: cancel_btn.configure(state="disabled"))
@@ -345,6 +405,7 @@ def run_gui():
         def do_cancel():
             cancel_event.set()
             cancel_btn.configure(state="disabled")
+            log.info("Cancelamento solicitado em %s", mode)
 
         action_btn.configure(command=do_op)
         cancel_btn.configure(command=do_cancel)
@@ -369,6 +430,7 @@ def run_gui():
                 cl = SyncClient(host, token)
                 client_ref["client"] = cl
                 save_config({"host": host})
+                log.info("Conectado em %s", host)
                 ui(lambda: pw_entry.delete(0, "end"))
                 ui(lambda: status_dot.configure(
                     text=f"●  Conectado → {host}", text_color="#2ECC71",
@@ -381,8 +443,10 @@ def run_gui():
                 for b in op_buttons:
                     ui(lambda _b=b: _b.configure(state="normal"))
             except Exception as e:
-                ui(lambda: status_dot.configure(
-                    text=f"●  {e}", text_color="#E74C3C",
+                err_msg = str(e)
+                log.warning("Falha de conexão: %s", err_msg)
+                ui(lambda m=err_msg: status_dot.configure(
+                    text=f"●  {m}", text_color="#E74C3C",
                 ))
                 ui(lambda: conn_btn.configure(state="normal"))
 
@@ -390,9 +454,10 @@ def run_gui():
 
     def do_disconnect():
         cl = client_ref["client"]
+        client_ref["client"] = None
         if cl:
             threading.Thread(target=cl.logout, daemon=True).start()
-            client_ref["client"] = None
+        log.info("Desconectado")
         status_dot.configure(text="●  Desconectado", text_color="#666")
         conn_btn.configure(
             text="Conectar", fg_color="#E67E22", hover_color="#D35400",
@@ -406,6 +471,7 @@ def run_gui():
 
     def on_close():
         do_disconnect()
+        log.info("GUI encerrada (log em %s)", log_file)
         root.after(300, root.destroy)
 
     root.protocol("WM_DELETE_WINDOW", on_close)
